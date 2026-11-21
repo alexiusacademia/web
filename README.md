@@ -256,8 +256,14 @@ turns the request into a WebSocket, which stays open: `ws.send(text)`,
 gets binary messages (without it they come to `onMessage` as text). A
 request that isn't asking for a WebSocket gets a 400. Middleware runs
 first, so a route can need a session or a password; the answer that opens
-it can't set cookies. Browsers send cookies with a WebSocket to another
-site only if they're `SameSite=None`, which `web`'s aren't unless you say.
+it can't set cookies.
+
+A page on another site could open a WebSocket in its visitor's name, so
+only this site's own pages may (by the `Origin` browsers send); others get
+a 403. `origins: ["https://app.example.com"]` lets those sites' pages in
+too, and `["*"]` any. Programs that aren't browsers send no `Origin` and
+are let in. An open WebSocket stays open when its user signs out: close it
+yourself if that matters.
 
 ## Middleware
 
@@ -342,8 +348,9 @@ a `Shared` value: stores with the same `name` are the same sessions, so
 every worker of `serveWorkers` sees them all;
 `web.databaseStore(path, table:)` keeps them in SQLite, so they last
 when the server restarts. A store is a struct of functions (`load`,
-`save`, `remove`, `removeWhere`, `count`), so a store for another
-database is a matter of filling them in.
+`save`, `remove`, `removeWhere`, `count`, and optionally `replace`, which
+saves a session only if it's still there, at once), so a store for
+another database is a matter of filling them in.
 
 ## Passwords
 
@@ -656,7 +663,7 @@ workers answered 3.3 times as many a second as one thread.
 tessel run tests
 ```
 
-runs about 3,400 checks: the router, requests and responses, the
+runs about 3,700 checks: the router, requests and responses, the
 middleware, signing (RFC 4231 and values from Python's `hmac`), password
 hashes (RFC 7914 and hashes from Python's `hashlib`), CSRF, rate limits,
 proxies, session stores, files, templates, a real server over TCP, and a

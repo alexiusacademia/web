@@ -57,16 +57,16 @@ public struct Response {
     fn withCookie(_ name: String, _ value: String, maxAge: Int = -1, path: String = "/",
                   domain: String = "", httpOnly: Bool = true, secure: Bool = false,
                   sameSite: String = "Lax") -> Response {
-        var line = "{name}={cookieValue(value)}"
+        var line = "{oneLine(name)}={cookieValue(value)}"
         if maxAge >= 0 {
             line += "; Max-Age={maxAge}"
             line += "; Expires=" + httpDate(now() + Float(maxAge))
         }
         if !path.isEmpty {
-            line += "; Path={path}"
+            line += "; Path={oneLine(path)}"
         }
         if !domain.isEmpty {
-            line += "; Domain={domain}"
+            line += "; Domain={oneLine(domain)}"
         }
         if httpOnly {
             line += "; HttpOnly"
@@ -75,7 +75,7 @@ public struct Response {
             line += "; Secure"
         }
         if !sameSite.isEmpty {
-            line += "; SameSite={sameSite}"
+            line += "; SameSite={oneLine(sameSite)}"
         }
         var copy = self
         copy.cookies = cookies.filter { c in !c.hasPrefix(name + "=") }
@@ -139,7 +139,8 @@ public fn bytes(_ data: Data, type: String = "application/octet-stream", status:
 // Sends the browser to another address. 302 (the default) and 303 make
 // it ask with GET; 307 and 308 keep the method; 301 and 308 are for good.
 public fn redirect(_ to: String, status: Int = 302) -> Response {
-    Response(status: status, headers: ["Location": to])
+    // (A line break would be a second Location: it's encoded instead.)
+    Response(status: status, headers: ["Location": to.replace("\r", with: "%0D").replace("\n", with: "%0A")])
 }
 
 // A status with a short text body: its reason ("Not Found") unless a
@@ -224,7 +225,10 @@ fn withoutHeader(_ headers: [String: String], _ name: String) -> [String: String
 fn cookieValue(_ value: String) -> String {
     var safe = true
     for c in value.characters {
-        if c == ";" || c == "," || c == " " || c == "\"" || c == "\\" || c == "%" || c == "\t" {
+        let code = Data(text: c)[0]
+        // (Control characters too: a line break would start another
+        // Set-Cookie.)
+        if c == ";" || c == "," || c == " " || c == "\"" || c == "\\" || c == "%" || code < 32 || code == 127 {
             safe = false
         }
     }
@@ -232,6 +236,11 @@ fn cookieValue(_ value: String) -> String {
         return value
     }
     value.urlEncoded
+}
+
+// Text without line breaks (for a cookie's name and attributes).
+fn oneLine(_ text: String) -> String {
+    text.replace("\r", with: "").replace("\n", with: "")
 }
 
 // The headers to send: the answer's, plus a Set-Cookie with a line for
@@ -266,12 +275,13 @@ public struct Stream {
     fn event(_ data: String, name: String = "", id: String = "") -> Bool {
         var text = ""
         if !name.isEmpty {
-            text += "event: {name}\n"
+            text += "event: {oneLine(name)}\n"
         }
         if !id.isEmpty {
-            text += "id: {id}\n"
+            text += "id: {oneLine(id)}\n"
         }
-        for line in data.split("\n") {
+        // (Every kind of line end ends a line of an event, `\r` alone too.)
+        for line in data.replace("\r\n", with: "\n").replace("\r", with: "\n").split("\n") {
             text += "data: {line}\n"
         }
         send(text + "\n")
@@ -329,6 +339,8 @@ public struct SocketBlocks {
     onMessage: fn(WebSocket, String)
     onData: fn(WebSocket, Data)?
     onClose: fn(WebSocket, String)
+    // The sites whose pages may open it ([]: this site's own).
+    origins: [String] = []
 }
 
 // Turns the request into a WebSocket: `onOpen` when it's open, `onMessage`
@@ -337,9 +349,37 @@ public struct SocketBlocks {
 // WebSocket gets a 400. Middleware runs first, as for any route (a
 // session or a password can be required), but the answer that opens the
 // WebSocket can't carry headers or cookies of its own.
+//
+// A page on another site could open it in its visitor's name (with their
+// cookies), so only this site's own pages may: a browser's request from
+// another site gets a 403. `origins` lists the other sites that may
+// ("https://app.example.com"), or `["*"]` for any. Programs that aren't
+// browsers send no Origin, and are let in. An open WebSocket stays open
+// when its user signs out: close it yourself if that matters.
 public fn webSocket(onOpen: fn(WebSocket) = openNothing, onMessage: fn(WebSocket, String),
-                    onData: fn(WebSocket, Data)? = nil, onClose: fn(WebSocket, String) = closeNothing) -> Response {
-    Response(status: 101, socket: SocketBlocks(onOpen: onOpen, onMessage: onMessage, onData: onData, onClose: onClose))
+                    onData: fn(WebSocket, Data)? = nil, onClose: fn(WebSocket, String) = closeNothing,
+                    origins: [String] = []) -> Response {
+    Response(status: 101, socket: SocketBlocks(onOpen: onOpen, onMessage: onMessage, onData: onData, onClose: onClose,
+                                               origins: origins))
+}
+
+// A route's WebSocket answer, checked against the request: a 400 if it
+// isn't asking for a WebSocket, a 403 from a page of another site.
+fn checkedSocket(_ request: Request, _ response: Response) -> Response {
+    if let blocks = response.socket {
+        let upgrade = (request.header("upgrade") ?? "").lowercase().contains("websocket")
+        if !upgrade || request.header("sec-websocket-key") == nil {
+            return text("This address takes a WebSocket", status: 400)
+        }
+        if let origin = request.header("origin") {
+            let host = request.header("host") ?? ""
+            let own = origin == "http://" + host || origin == "https://" + host
+            if !own && !blocks.origins.contains("*") && !blocks.origins.contains(origin) {
+                return text("This WebSocket takes pages of its own site only", status: 403)
+            }
+        }
+    }
+    response
 }
 
 fn openNothing(_ socket: WebSocket) {}

@@ -105,19 +105,19 @@ fn routes() -> web.Router {
     api.get("/notes") { r in web.json(notes.get()) }
     // How many notes there are, sent again whenever it changes.
     api.get("/live") { r in
+        var timer = -1
         web.webSocket(onOpen: { ws in
             var last = -1
-            var timer = 0
             timer = every(seconds: 0.5) {
                 let count = notes.get().count
                 if count != last {
                     last = count
-                    if !ws.send("{count}") {
-                        stopTimer(timer)
-                    }
+                    ws.send("{count}")
                 }
             }
-        }, onMessage: { ws, text in })
+        }, onMessage: { ws, text in }, onClose: { ws, reason in
+            stopTimer(timer)
+        })
     }
     api.get("/notes/:id") { r in
         for note in notes.get() {

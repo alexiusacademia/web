@@ -121,6 +121,10 @@ public fn compress(minimum: Int = 1024) -> Middleware {
         if !acceptsGzip(accept) || response.body.count < minimum || response.header("content-encoding") != nil {
             return response
         }
+        // (An answer in pieces or a WebSocket has no body here to compress.)
+        if response.stream != nil || response.socket != nil {
+            return response
+        }
         if response.status != 200 || request.method == "HEAD" {
             return response
         }
@@ -272,13 +276,22 @@ public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 120
                     return r.withoutCookie(cookie)
                 }
                 var id = oldId
+                let saved = StoredSession(values: values, expires: now() + Float(maxAge))
                 if id.isEmpty || response.renew {
                     if !id.isEmpty {
                         s.remove(id)
                     }
                     id = source.token()
+                    s.save(id, saved)
+                } else if let replace = s.replace {
+                    // (At once: a session ended by another worker meanwhile
+                    // isn't brought back.)
+                    if !replace(id, saved) {
+                        return r
+                    }
+                } else {
+                    s.save(id, saved)
                 }
-                s.save(id, StoredSession(values: values, expires: now() + Float(maxAge)))
                 return r.withCookie(cookie, sign(id, secret: key), maxAge: maxAge, secure: secure, sameSite: sameSite)
             }
             if values.isEmpty {

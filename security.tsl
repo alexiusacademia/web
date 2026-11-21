@@ -210,8 +210,8 @@ struct RateWindow {
 
 // The counts of every `rateLimit`, for all threads (a server's workers
 // each make their own middleware; the counts are the same for all): by
-// limit and client.
-let rateCounts = Shared<[String: RateWindow]>([:])
+// limit and client, in 64 parts, so a change copies and locks only one.
+let rateShards = sharded(RateWindow(start: 0, count: 0))
 
 // Lets each client make at most `requests` requests every `seconds`;
 // more get a 429 with Retry-After. Clients are told apart by `key`: their
@@ -230,19 +230,31 @@ public fn rateLimit(requests: Int, seconds: Float, key: fn(Request) -> String = 
         let t = now()
         let k = prefix + key(request)
         var w = RateWindow(start: t, count: 0)
-        rateCounts.update { all in
+        rateShards[shardOf(k)].update { all in
             var counts = all
-            // Too many clients: forget those whose window has ended (and,
-            // if all are still counting, start again rather than run out
-            // of memory).
-            if counts.count > maxClients {
-                var kept: [String: RateWindow] = [:]
-                for (ck, cw) in counts {
-                    if t - cw.start < seconds {
-                        kept[ck] = cw
+            // Now and then, and when this limit has more than its share of
+            // clients here, forget its windows that have ended (another
+            // limit's are its own to forget); if they're all still counting,
+            // start again rather than run out of memory.
+            let share = max(maxClients / shardCount, 16)
+            if counts.count > share || random(0..64) == 0 {
+                var mine = 0
+                for (ck, cw) in all {
+                    if ck.hasPrefix(prefix) {
+                        if t - cw.start >= seconds {
+                            counts[ck] = nil
+                        } else {
+                            mine += 1
+                        }
                     }
                 }
-                counts = if kept.count > maxClients { [:] } else { kept }
+                if mine > share {
+                    for (ck, _) in all {
+                        if ck.hasPrefix(prefix) {
+                            counts[ck] = nil
+                        }
+                    }
+                }
             }
             w = counts[k] ?? RateWindow(start: t, count: 0)
             if t - w.start >= seconds {

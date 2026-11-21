@@ -10,13 +10,13 @@
   <meta name="author" content="Alexius Academia">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>web · Web servers for Tessel</title>
-  <meta name="description" content="web is a Tessel library for web servers: routes with values in the path, middleware, forms, uploads, cookies, sessions, password hashes, CSRF tokens, rate limits, static files and HTML templates.">
+  <meta name="description" content="web is a Tessel library for web servers: routes with values in the path, middleware, forms, uploads, cookies, sessions, password hashes, CSRF tokens, rate limits, static files, HTML templates, answers in pieces, WebSockets and worker threads.">
   <meta name="theme-color" content="#c93045">
   <link rel="canonical" href="https://web-package.syncster.dev/">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="web">
   <meta property="og:title" content="web · Web servers for Tessel">
-  <meta property="og:description" content="Routes, middleware, forms, cookies, sessions, password hashes, CSRF tokens, rate limits, static files and Handlebars-style templates for Tessel programs. Nothing else to install.">
+  <meta property="og:description" content="Routes, middleware, forms, cookies, sessions, password hashes, CSRF tokens, rate limits, static files, Handlebars-style templates, server-sent events, WebSockets and worker threads for Tessel programs. Nothing else to install.">
   <meta property="og:url" content="https://web-package.syncster.dev/">
   <meta property="og:image" content="https://web-package.syncster.dev/assets/share.png">
   <meta property="og:image:width" content="1200">
@@ -54,7 +54,7 @@
     <div>
       <p class="eyebrow">A Tessel library</p>
       <h1>Web servers in a few lines of Tessel.</h1>
-      <p class="lede">Routes with values in the path, middleware, forms, uploads, cookies, sessions, password hashes, CSRF tokens, rate limits, folders of static files and HTML templates. It's built on Tessel's own HTTP server, with nothing else to install.</p>
+      <p class="lede">Routes with values in the path, middleware, forms, uploads, cookies, sessions, password hashes, CSRF tokens, rate limits, folders of static files, HTML templates, answers in pieces, WebSockets, and worker threads that keep serving when a handler fails. It's built on Tessel's own HTTP server, with nothing else to install.</p>
       <div class="install">
         <code>tessel add web</code>
         <button class="copy" type="button" data-copy="tessel add web">Copy</button>
@@ -63,7 +63,7 @@
         <a class="button primary" href="#examples">See examples</a>
         <a class="button" href="https://github.com/alexiusacademia/web">Code on GitHub</a>
       </div>
-      <p class="meta">Version 0.2.0 · MIT licence · Tessel 0.23.1 or later · no dependencies</p>
+      <p class="meta">Version 0.3.0 · MIT licence · Tessel 0.24.0 or later · no dependencies</p>
     </div>
     <div class="preview">
       <div class="panel">
@@ -453,6 +453,182 @@ all good</pre>
         </div>
       </article>
 
+      <article class="example" id="workers">
+        <h3>On several threads</h3>
+        <p><code>web.serveWorkers</code> answers requests on several threads at once, so a slow request doesn't hold up the others and the server uses more of the computer's cores. Threads share no variables, so each worker makes its own router with a top-level function, and what every request should see goes in a <code>Shared</code> value (or a database). A runtime error in a handler stops only its worker: the request gets a 500, the error is printed, and a new worker takes its place.</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+let visits = Shared(0)
+
+fn routes() -> web.Router {
+    var router = web.Router()
+    router.use(web.logger())
+    router.get("/") { r in
+        web.text("Visit {visits.update { n in n + 1 }}")
+    }
+    router.get("/crash") { r in
+        let list = [1, 2, 3]
+        web.text("{list[5]}")
+    }
+    router
+}
+
+fn main() {
+    let server = web.serveWorkers(routes, port: 8080, workers: 4)
+    print("Serving at http://127.0.0.1:{tcpPort(server)}/")
+}</pre>
+          </div>
+          <div class="out">
+            <p class="label">With curl</p>
+<pre class="http">$ curl 127.0.0.1:8080/
+Visit 1
+$ curl 127.0.0.1:8080/
+Visit 2
+$ curl -i 127.0.0.1:8080/crash
+HTTP/1.1 500 Internal Server Error
+Content-Type: text/plain; charset=utf-8
+Content-Length: 21
+
+Internal Server Error
+$ curl 127.0.0.1:8080/
+Visit 3
+$ curl 127.0.0.1:8080/
+Visit 4</pre>
+            <p class="label">What the server prints</p>
+<pre>Serving at http://127.0.0.1:8080/
+127.0.0.1 GET / 200 7 B 0.02 ms
+127.0.0.1 GET / 200 7 B 0.02 ms
+error: index 5 is out of range for a list of 3 items
+ --> main.tsl:13:20
+127.0.0.1 GET / 200 7 B 0.01 ms
+127.0.0.1 GET / 200 7 B 0.01 ms</pre>
+            <p class="note">Whichever worker answers, the count goes on. <code>web.memoryStore()</code> sessions and <code>web.rateLimit</code> counts are kept in <code>Shared</code> values too, so every worker sees the same ones. On one thread, with <code>web.serve</code>, the same mistake stops the program.</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="example" id="events">
+        <h3>Answers in pieces and server-sent events</h3>
+        <p><code>web.stream { out in … }</code> sends the status and headers first, then whatever the block sends with <code>out.send</code> or <code>out.sendData</code>, now or from later blocks, until <code>out.end()</code>. <code>web.events</code> is the same for server-sent events, which a page reads with <code>new EventSource("/countdown")</code>. Each send gives <code>false</code> once the client has gone.</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+fn main() {
+    var router = web.Router()
+    router.get("/report") { r in
+        web.stream { out in
+            for part in ["Counting", "Adding up", "Done"] {
+                out.send("{part}\n")
+            }
+            out.end()
+        }
+    }
+    router.get("/countdown") { r in
+        web.events { out in
+            var n = 3
+            var timer = 0
+            timer = every(seconds: 1) {
+                if n == 0 {
+                    out.event("Lift-off", name: "done")
+                    out.end()
+                    stopTimer(timer)
+                } else if out.event("{n}", id: "{n}") {
+                    n -= 1
+                } else {
+                    stopTimer(timer)
+                }
+            }
+        }
+    }
+    web.serve(router, port: 8080)
+}</pre>
+          </div>
+          <div class="out">
+            <p class="label">With curl</p>
+<pre class="http">$ curl -i 127.0.0.1:8080/report
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Transfer-Encoding: chunked
+
+Counting
+Adding up
+Done
+$ curl -i -N 127.0.0.1:8080/countdown
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+X-Accel-Buffering: no
+Transfer-Encoding: chunked
+
+id: 3
+data: 3
+
+id: 2
+data: 2
+
+id: 1
+data: 1
+
+event: done
+data: Lift-off</pre>
+            <p class="note">The events come a second apart. Middleware has its say on the status and headers, as for any answer; <code>out.queued()</code> says how much a slow client hasn't taken yet.</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="example" id="websockets">
+        <h3>WebSockets</h3>
+        <p>A route that answers with <code>web.webSocket(onOpen:, onMessage:, onData:, onClose:)</code> turns the request into a WebSocket, which stays open: <code>ws.send</code>, <code>ws.sendData</code> and <code>ws.close()</code> work from any block. Middleware runs first, so a route can need a session or a password. A request that isn't asking for a WebSocket gets a 400, and a page from another site a 403 (<code>origins:</code> lets other sites in).</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+fn main() {
+    var router = web.Router()
+    router.get("/chat") { r in
+        let name = r.queryValue("name") ?? "stranger"
+        web.webSocket(onOpen: { ws in
+            ws.send("Welcome, {name}")
+        }, onMessage: { ws, text in
+            if text == "bye" {
+                ws.close()
+            } else {
+                ws.send("You said: {text.uppercase()}")
+            }
+        }, onClose: { ws, reason in
+            print("{name} left: {reason}")
+        })
+    }
+    web.serve(router, port: 8080)
+}</pre>
+            <p class="label">client.mjs, for Node 24</p>
+<pre>const ws = new WebSocket("ws://127.0.0.1:8080/chat?name=Ann");
+ws.onopen = () =&gt; { ws.send("hello"); ws.send("bye"); };
+ws.onmessage = e =&gt; console.log("got:", e.data);
+ws.onclose = e =&gt; console.log("closed:", e.code);</pre>
+          </div>
+          <div class="out">
+            <p class="label">Running the client, then curl</p>
+<pre class="http">$ node client.mjs
+got: Welcome, Ann
+got: You said: HELLO
+closed: 1000
+$ curl -i 127.0.0.1:8080/chat
+HTTP/1.1 400 Bad Request
+Content-Type: text/plain; charset=utf-8
+Content-Length: 30
+
+This address takes a WebSocket</pre>
+            <p class="label">What the server prints</p>
+<pre>Ann left: closed</pre>
+            <p class="note">The answer that opens a WebSocket can't set cookies. Browsers send cookies with a WebSocket to another site only if they're <code>SameSite=None</code>, which <code>web</code>'s aren't unless you say.</p>
+          </div>
+        </div>
+      </article>
+
       <article class="example" id="testing">
         <h3>Testing without a network</h3>
         <p><code>web.call(router, method, path, body:, headers:)</code> runs a request through a router and gives the answer, so a test needs no server and no port.</p>
@@ -487,14 +663,14 @@ ok    other paths are not found  (8 ms)
       </article>
 
     </div>
-    <p class="note"><code>examples/notes</code> in the repository is a whole small site: pages from templates with a layout, a form, a JSON API and a stylesheet, and signing in with hashed passwords checked by <code>checkPasswordLater</code>, sessions on the server, a CSRF token in every form, a rate limit on <code>/login</code> and <code>proxy()</code>.</p>
+    <p class="note"><code>examples/notes</code> in the repository is a whole small site on four workers: pages from templates with a layout, a form, a JSON API, live updates over a WebSocket and a stylesheet, and signing in with hashed passwords checked by <code>checkPasswordLater</code>, sessions on the server, a CSRF token in every form, a rate limit on <code>/login</code> and <code>proxy()</code>.</p>
   </div>
 </section>
 
 <section id="running">
   <div class="wrap">
     <h2>Running it for real</h2>
-    <p class="intro">The server speaks plain HTTP. On the internet, put it behind a proxy that does HTTPS, like Caddy, with the server on its default host, <code>127.0.0.1</code>, so only the proxy can reach it. Put <code>router.use(web.proxy())</code> first, so <code>r.ip</code> is the visitor's address (not the proxy's) and <code>r.secure</code> says they used HTTPS; cookies then want <code>secure: true</code>. Have systemd start it again if it stops.</p>
+    <p class="intro">The server speaks plain HTTP, and while a handler that fails on a worker only costs its request a 500, a program can still stop (it runs out of memory, or <code>web.serve</code> without workers meets a mistake). On the internet, put it behind a proxy that does HTTPS, like Caddy, with the server on its default host, <code>127.0.0.1</code>, so only the proxy can reach it. Put <code>router.use(web.proxy())</code> first, so <code>r.ip</code> is the visitor's address (not the proxy's) and <code>r.secure</code> says they used HTTPS; cookies then want <code>secure: true</code>. Have systemd start it again if it stops.</p>
     <div class="split">
       <div>
         <p class="label">Caddyfile</p>
@@ -520,11 +696,11 @@ User=myapp
 WantedBy=multi-user.target</pre>
       </div>
     </div>
-    <h3>What it doesn't do (yet)</h3>
+    <h3>Good to know</h3>
     <div class="features">
-      <div class="feature"><b>One request at a time</b><span>The server answers on one thread. Keep long work off it: <code>background</code> for computing, <code>later</code> routes for answers that wait, <code>checkPasswordLater</code> for passwords.</span></div>
-      <div class="feature"><b>A crash stops the server</b><span>A mistake in a handler that stops the program (an index outside a list, say) stops the server too. That's why <code>Restart=always</code>.</span></div>
-      <div class="feature"><b>No streaming or WebSockets</b><span>Bodies up to 64 MB are read whole into memory, and answers are sent whole. There's no WebSocket server yet.</span></div>
+      <div class="feature"><b>Serve on workers</b><span><code>web.serveWorkers</code> answers on several threads. <code>web.serve</code> answers one request at a time: there, keep long work off the server's thread with <code>background</code> for computing, <code>later</code> routes for answers that wait and <code>checkPasswordLater</code> for passwords.</span></div>
+      <div class="feature"><b>A crash costs one request</b><span>On a worker, a mistake in a handler (an index outside a list, say) gets that request a 500 and a new worker. On one thread it stops the program, and <code>Restart=always</code> starts it again.</span></div>
+      <div class="feature"><b>Bodies are read whole</b><span>Request bodies up to 64 MB are read whole into memory. Answers can go in pieces with <code>web.stream</code> and <code>web.events</code>, and a route can be a WebSocket.</span></div>
     </div>
   </div>
 </section>
@@ -532,16 +708,16 @@ WantedBy=multi-user.target</pre>
 <section id="tested">
   <div class="wrap">
     <h2>Tested</h2>
-    <p class="intro"><code>tessel run tests</code> runs the router, requests and responses, the middleware, signing, password hashes, CSRF, rate limits, proxies, session stores, files, templates, and a real server over TCP. They pass on macOS, and on Linux (ARM64 and x64) with Tessel's Linux release, where the library was also run behind Caddy over HTTPS. The templates are compared with what Handlebars 4.7.8 gives, on cases written by hand and many made at random.</p>
+    <p class="intro"><code>tessel run tests</code> runs the router, requests and responses, the middleware, signing, password hashes, CSRF, rate limits, proxies, session stores, files, templates, a real server over TCP, and a server on three workers (a session and counts seen by all of them, a handler that fails, answers in pieces and a WebSocket route). They pass on macOS, and on Linux (ARM64 and x64) with Tessel 0.24.0's Linux release, where the library was also run behind Caddy over HTTPS. The templates are compared with what Handlebars 4.7.8 gives, on cases written by hand and many made at random.</p>
     <div class="stats">
-      <div class="stat"><b>3,403</b><span>checks, all passing on macOS and on Linux ARM64 and x64</span></div>
+      <div class="stat"><b>3,730</b><span>checks, all passing on macOS and on Linux ARM64 and x64</span></div>
       <div class="stat"><b>3,076</b><span>templates that give what Handlebars 4.7.8 gives</span></div>
       <div class="stat"><b>RFC 4231 · 7914</b><span>and Python's <code>hmac</code> and <code>hashlib</code> for HMAC-SHA256 and the PBKDF2 password hashes</span></div>
-      <div class="stat"><b>~90,000</b><span>requests a second for a JSON API</span></div>
-      <div class="stat"><b>~45,000</b><span>requests a second for a page from templates with a layout</span></div>
-      <div class="stat"><b>~34,000</b><span>requests a second for a static stylesheet</span></div>
+      <div class="stat"><b>~98,000</b><span>requests a second for a JSON API, on four workers</span></div>
+      <div class="stat"><b>~42,000</b><span>requests a second for a page from templates with a layout, on four workers</span></div>
+      <div class="stat"><b>3.3×</b><span>as many slow, CPU-heavy requests a second on four workers as on one thread</span></div>
     </div>
-    <p class="note">Speeds are from ApacheBench (<code>ab -k -c 20</code>) against <code>examples/notes</code> on an M-series Mac.</p>
+    <p class="note">Speeds are from ApacheBench (<code>ab -k -c 20</code>) against <code>examples/notes</code> on four workers, on an M-series Mac. The slow requests are Tessel's own test of a request that takes real work.</p>
   </div>
 </section>
 
@@ -562,7 +738,7 @@ WantedBy=multi-user.target</pre>
       <tr><td><code>files(prefix, folder:, options:)</code></td><td>A folder of files. <code>FileOptions</code> has <code>index</code>, <code>maxAge</code> and <code>dotFiles</code>.</td></tr>
       <tr><td><code>notFound { r in … }</code></td><td>What answers when no route fits.</td></tr>
     </table></div>
-    <p class="intro" style="margin-top:14px">A pattern's parts can be <code>:name</code> (one part of the path) or, at the end, <code>*name</code> (the rest of the path). Fixed text wins over <code>:name</code>, and <code>:name</code> over <code>*name</code>, whatever order the routes were added in. <code>web.serve(router, port:, host:)</code> starts the server and returns its id, or -1 if it can't listen. It listens on this computer only unless <code>host: "0.0.0.0"</code>, and speaks HTTP/1.1, not HTTPS: on the internet, put it behind a server that does HTTPS.</p>
+    <p class="intro" style="margin-top:14px">A pattern's parts can be <code>:name</code> (one part of the path) or, at the end, <code>*name</code> (the rest of the path). Fixed text wins over <code>:name</code>, and <code>:name</code> over <code>*name</code>, whatever order the routes were added in. <code>web.serve(router, port:, host:)</code> starts the server and returns its id, or -1 if it can't listen. <code>web.serveWorkers(routes, port:, host:, workers:)</code> does the same on several threads (4 by default): <code>routes</code> is a top-level function, <code>fn routes() -&gt; web.Router</code>, that each worker calls to make its own router, and a handler that hits a runtime error answers 500 while its worker is replaced. It listens on this computer only unless <code>host: "0.0.0.0"</code>, and speaks HTTP/1.1, not HTTPS: on the internet, put it behind a server that does HTTPS.</p>
 
     <h3>Requests</h3>
     <div class="table"><table>
@@ -593,8 +769,18 @@ WantedBy=multi-user.target</pre>
       <tr><td><code>web.status(code, message)</code></td><td>A status with its reason as the body, or a message.</td></tr>
       <tr><td><code>web.file(path, request, maxAge:, download:)</code></td><td>A file, with caching and ranges.</td></tr>
       <tr><td><code>web.page(templates, name, data, layout:)</code></td><td>A page from templates.</td></tr>
+      <tr><td><code>web.stream(type:, status:) { out in … }</code></td><td>An answer in pieces: the block gets a <code>Stream</code> once the status and headers are out. Without a Content-Length it goes in chunks.</td></tr>
+      <tr><td><code>web.events { out in … }</code></td><td>Server-sent events, for <code>new EventSource(url)</code>.</td></tr>
+      <tr><td><code>web.webSocket(onOpen:, onMessage:, onData:, onClose:, origins:)</code></td><td>Turns the request into a WebSocket; a request that isn't asking for one gets a 400, and a page from another site (not in <code>origins</code>) a 403. Middleware runs first.</td></tr>
     </table></div>
     <p class="intro" style="margin-top:14px">A <code>web.Response</code> (<code>status</code>, <code>headers</code>, <code>body</code>) changes with <code>withHeader</code>, <code>withStatus</code>, <code>withCookie(name, value, maxAge:, path:, domain:, httpOnly:, secure:, sameSite:)</code>, <code>withoutCookie</code> and <code>withSession(values, renew:)</code>. Cookies are <code>HttpOnly</code> and <code>SameSite=Lax</code> unless you say otherwise.</p>
+    <div class="table"><table>
+      <tr><th>Stream and WebSocket</th><th></th></tr>
+      <tr><td><code>out.send(text)</code>, <code>out.sendData(data)</code></td><td>A piece of the answer. <code>false</code> once the client has gone.</td></tr>
+      <tr><td><code>out.event(data, name:, id:)</code></td><td>A server-sent event: each line of <code>data</code>, with an event name and an id if given.</td></tr>
+      <tr><td><code>out.queued()</code>, <code>out.end()</code></td><td>Bytes sent but not yet taken by the client (wait while it grows), and the end of the answer.</td></tr>
+      <tr><td><code>ws.send(text)</code>, <code>ws.sendData(data)</code>, <code>ws.close()</code></td><td>A text or binary message, from any block; <code>false</code> once it's closed. <code>onData</code> gets binary messages (without it they come to <code>onMessage</code> as text), and <code>onClose</code> gets why it closed.</td></tr>
+    </table></div>
 
     <h3>Middleware</h3>
     <div class="table"><table>
@@ -604,7 +790,7 @@ WantedBy=multi-user.target</pre>
       <tr><td><code>basicAuth(realm:) { user, password in … }</code></td><td>Asks for a name and password; the name goes in <code>values["user"]</code>. Only over HTTPS.</td></tr>
       <tr><td><code>sessions(secret:, cookie:, maxAge:, secure:, sameSite:, store:)</code></td><td>Sessions in a signed cookie, or on the server with a <code>store</code> (the cookie then holds a signed random id). Two weeks from when last saved.</td></tr>
       <tr><td><code>csrf(secret:, cookie:, field:, header:, secure:)</code></td><td>A token that forms must send back (field <code>_csrf</code> or header <code>X-CSRF-Token</code>), or a request with any method but GET, HEAD and OPTIONS gets a 403. Kept in the session once there is one (put <code>sessions</code> first), and in a <code>__Host-</code> cookie over HTTPS before that.</td></tr>
-      <tr><td><code>rateLimit(requests:, seconds:, key:, maxClients:)</code></td><td>A 429 with <code>Retry-After</code> for a client that asks too often; by IP address (an IPv6 address by its /64) unless <code>key:</code> says otherwise. Counts in memory.</td></tr>
+      <tr><td><code>rateLimit(requests:, seconds:, key:, maxClients:, name:)</code></td><td>A 429 with <code>Retry-After</code> for a client that asks too often; by IP address (an IPv6 address by its /64) unless <code>key:</code> says otherwise. Counts in memory, in a <code>Shared</code> value all of a server's workers count in; limits with the same <code>name:</code> share their counts, so give each of several limits a name of its own.</td></tr>
       <tr><td><code>proxy(trusted:)</code></td><td>The client's real address and HTTPS behind a proxy (<code>X-Forwarded-For</code>, <code>X-Forwarded-Proto</code>). Put it first.</td></tr>
       <tr><td><code>compress(minimum:)</code></td><td>gzip for text, HTML, CSS, JavaScript, JSON, XML and SVG, for clients that take it.</td></tr>
       <tr><td><code>securityHeaders(contentSecurityPolicy:)</code></td><td><code>nosniff</code>, no framing, a strict referrer policy, and a CSP if given.</td></tr>
@@ -620,10 +806,10 @@ WantedBy=multi-user.target</pre>
       <tr><td><code>web.checkPassword(password, hash)</code></td><td>Whether a password fits a hash (Django's too).</td></tr>
       <tr><td><code>web.hashPasswordLater(password) { hash in … }</code></td><td><code>hashPassword</code> on another thread, for handlers, so other requests go on.</td></tr>
       <tr><td><code>web.checkPasswordLater(password, hash) { ok in … }</code></td><td><code>checkPassword</code> on another thread, for handlers.</td></tr>
-      <tr><td><code>web.tokens(secret:)</code></td><td>A source of secret tokens, made once at the start: <code>.token()</code> gives 43 random characters for a reset link or an API key. It reads 64 bytes from the system's secure random numbers a few milliseconds after it's made.</td></tr>
+      <tr><td><code>web.tokens()</code></td><td>A source of secret tokens from the system's secure random numbers (Tessel's <code>randomBytes</code>): <code>.token(bytes:)</code> gives 43 URL-safe characters (32 bytes) for a reset link or an API key, and <code>.bytes(count)</code> the bytes. <code>secret:</code> is no longer needed and is ignored; it's kept for programs written for 0.2.</td></tr>
       <tr><td><code>web.pbkdf2(password:, salt:, iterations:, length:)</code></td><td>PBKDF2-HMAC-SHA256 of <code>Data</code>, for keys of your own.</td></tr>
       <tr><td><code>web.csrfField(r)</code>, <code>web.csrfToken(r)</code></td><td>A hidden form field with the CSRF token (<code>{{{csrf}}}</code> in a template), and the token itself for an <code>X-CSRF-Token</code> header.</td></tr>
-      <tr><td><code>web.memoryStore()</code></td><td>Sessions kept in memory; they end with the program.</td></tr>
+      <tr><td><code>web.memoryStore(limit:, name:)</code></td><td>Sessions kept in memory, in a <code>Shared</code> value: stores with the same <code>name</code> are the same sessions, so every worker sees them all. They end with the program; past <code>limit</code>, 100,000, the ones nearest their end go first.</td></tr>
       <tr><td><code>web.databaseStore(path, table:)</code></td><td>Sessions kept in SQLite, so they last when the server restarts. It gives a <code>Result</code>: <code>try</code> it.</td></tr>
     </table></div>
     <p class="intro" style="margin-top:14px">A store is a struct of functions (<code>load</code>, <code>save</code>, <code>remove</code>, <code>removeWhere</code>, <code>count</code>), so a store for another database is a matter of filling them in. <code>sessions.removeWhere { s in s["user"] == "ann" }</code> signs Ann out everywhere.</p>

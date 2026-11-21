@@ -222,9 +222,9 @@ fn dispatch(_ router: Router, _ request: Request, _ reply: fn(Response)) {
     req.params = bestParams
     runChain(route.middleware, 0, req, { r, done in
         if let later = route.later {
-            later(r, done)
+            later(r, { response in done(checkedSocket(r, response)) })
         } else {
-            done(route.answer(r))
+            done(checkedSocket(r, route.answer(r)))
         }
     }, reply)
 }

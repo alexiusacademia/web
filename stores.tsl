@@ -20,74 +20,125 @@ public struct SessionStore {
     removeWhere: fn(fn([String: String]) -> Bool) -> Int
     // The sessions there are now (ended ones aren't counted).
     count: fn() -> Int
+    // Saves a session that's there already, at once: false (and nothing
+    // saved) if it isn't there any more. Optional: without it, `sessions`
+    // looks with `load`, then saves.
+    replace: (fn(String, StoredSession) -> Bool)? = nil
 }
 
-// The sessions of every `memoryStore`, for all threads: by store name
-// and id ("sessions|id").
-let memorySessions = Shared<[String: StoredSession]>([:])
+// How many parts the shared tables are in: a change copies and locks one
+// part, not all of them.
+let shardCount = 64
+
+// `shardCount` empty tables of `T`s by key (`sample` only gives the type).
+fn sharded<T>(_ sample: T) -> [Shared<[String: T]>] {
+    var parts: [Shared<[String: T]>] = []
+    for _ in 0..shardCount {
+        let empty: [String: T] = [:]
+        parts.append(Shared(empty))
+    }
+    parts
+}
+
+// Which part a key is in (FNV-1a of its bytes).
+fn shardOf(_ key: String) -> Int {
+    let d = Data(text: key)
+    var h = 2166136261
+    for i in 0..d.count {
+        h = ((h ^ d[i]) * 16777619) % 4294967296
+    }
+    h % shardCount
+}
+
+// The sessions of every `memoryStore`, for all threads: by store name and
+// id ("sessions|id"), in parts.
+let sessionShards = sharded(StoredSession(values: [:], expires: 0))
 
 // Sessions in memory: they end when the program does. Stores with the same
 // `name` are the same sessions, so a server's workers, each making its own
-// store, all see every session. At most `limit` are kept: past it, the
-// ones nearest their end go first.
+// store, all see every session. At most about `limit` are kept: past it,
+// the ones nearest their end go first.
 public fn memoryStore(limit: Int = 100000, name: String = "sessions") -> SessionStore {
     let prefix = name + "|"
+    let share = max(limit / shardCount, 16)
     SessionStore(load: { id in
-        memorySessions.get()[prefix + id]
+        sessionShards[shardOf(id)].get()[prefix + id]
     }, save: { id, session in
-        memorySessions.update { all in
+        sessionShards[shardOf(id)].update { all in
             var items = all
             items[prefix + id] = session
-            // Too many: forget ended sessions, then the ones nearest their end.
-            // (Looked at only when there are more than `limit` of all
-            // stores' sessions.)
-            let mine = if items.count > limit { items.keys.filter { k in k.hasPrefix(prefix) } } else { [] }
-            if mine.count > limit {
-                let t = now()
-                for k in mine {
-                    if (items[k]?.expires ?? 0) <= t {
-                        items[k] = nil
-                    }
-                }
-                let left = items.keys.filter { k in k.hasPrefix(prefix) }
-                if left.count > limit {
-                    let order = left.sorted(by: { x, y in (items[x]?.expires ?? 0) < (items[y]?.expires ?? 0) })
-                    for k in order.slice(from: 0, to: left.count - limit * 9 / 10) {
-                        items[k] = nil
-                    }
-                }
+            if items.count > share || random(0..64) == 0 {
+                pruneSessions(items, prefix, share)
+            } else {
+                items
             }
-            items
         }
     }, remove: { id in
-        memorySessions.update { all in
+        sessionShards[shardOf(id)].update { all in
             var items = all
             items[prefix + id] = nil
             items
         }
     }, removeWhere: { test in
         var removed = 0
-        memorySessions.update { all in
-            var items = all
-            for (k, s) in all {
-                if k.hasPrefix(prefix) && test(s.values) {
-                    items[k] = nil
-                    removed += 1
+        for part in sessionShards {
+            part.update { all in
+                var items = all
+                for (k, s) in all {
+                    if k.hasPrefix(prefix) && test(s.values) {
+                        items[k] = nil
+                        removed += 1
+                    }
                 }
+                items
             }
-            items
         }
         removed
     }, count: {
         let t = now()
         var n = 0
-        for (k, s) in memorySessions.get() {
-            if k.hasPrefix(prefix) && s.expires > t {
-                n += 1
+        for part in sessionShards {
+            for (k, s) in part.get() {
+                if k.hasPrefix(prefix) && s.expires > t {
+                    n += 1
+                }
             }
         }
         n
+    }, replace: { id, session in
+        // (Only if it's still there: a session ended meanwhile stays ended.)
+        var kept = false
+        sessionShards[shardOf(id)].update { all in
+            if all[prefix + id] == nil {
+                return all
+            }
+            var items = all
+            items[prefix + id] = session
+            kept = true
+            items
+        }
+        kept
     })
+}
+
+// A part's sessions without the ended ones of the store `prefix`, and, if
+// it still has more than `share` of them, without those nearest their end.
+fn pruneSessions(_ items: [String: StoredSession], _ prefix: String, _ share: Int) -> [String: StoredSession] {
+    let t = now()
+    var kept = items
+    for (k, s) in items {
+        if k.hasPrefix(prefix) && s.expires <= t {
+            kept[k] = nil
+        }
+    }
+    let mine = kept.keys.filter { k in k.hasPrefix(prefix) }
+    if mine.count > share {
+        let order = mine.sorted(by: { x, y in (kept[x]?.expires ?? 0) < (kept[y]?.expires ?? 0) })
+        for k in order.slice(from: 0, to: mine.count - share * 9 / 10) {
+            kept[k] = nil
+        }
+    }
+    kept
 }
 
 // Sessions in a table of a SQLite database (made if it isn't there), so
@@ -151,6 +202,14 @@ public fn databaseStore(_ path: String, table: String = "web_sessions") -> Resul
         match db.query("SELECT COUNT(*) AS n FROM {table} WHERE expires > ?", [now()]) {
             .ok(rows) -> if rows.isEmpty { 0 } else { rows[0].int("n") }
             .failure(_) -> 0
+        }
+    }, replace: { id, session in
+        match db.execute("UPDATE {table} SET data = ?, expires = ? WHERE id = ?", [toJson(session.values), session.expires, id]) {
+            .ok(changed) -> changed > 0
+            .failure(e) -> {
+                printError("web: can't save a session: {e.message}")
+                false
+            }
         }
     })
     Result.ok(value: store)

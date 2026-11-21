@@ -390,6 +390,66 @@ fn signing(_ t: Tally) -> Tally {
     t2
 }
 
+fn hardening(_ t: Tally) -> Tally {
+    var t2 = t
+    // A line break can't make another header.
+    let c = web.text("x").withCookie("lang", "en\nsession=forged", path: "/\nx", sameSite: "Lax\r\nEvil: 1")
+    t2.same("cookie line break", c.cookies[0], "lang=en%0Asession%3Dforged; Path=/x; HttpOnly; SameSite=LaxEvil: 1")
+    t2.same("redirect line break", web.redirect("/a\r\nSet-Cookie: x=1").header("location") ?? "", "/a%0D%0ASet-Cookie: x=1")
+
+    // WebSocket routes: a request that isn't one, and pages of other sites.
+    var router = web.Router()
+    router.get("/ws") { r in web.webSocket(onMessage: { ws, text in }) }
+    router.get("/open") { r in web.webSocket(onMessage: { ws, text in }, origins: ["https://app.example.com"]) }
+    let upgrade = ["Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                   "Host": "site.example"]
+    t2.number("ws plain request", ask(router, "GET", "/ws").status, 400)
+    t2.number("ws no origin", ask(router, "GET", "/ws", headers: upgrade).status, 101)
+    var own = upgrade
+    own["Origin"] = "https://site.example"
+    t2.number("ws own site", ask(router, "GET", "/ws", headers: own).status, 101)
+    var other = upgrade
+    other["Origin"] = "https://evil.example"
+    t2.number("ws other site", ask(router, "GET", "/ws", headers: other).status, 403)
+    var listed = upgrade
+    listed["Origin"] = "https://app.example.com"
+    t2.number("ws listed site", ask(router, "GET", "/open", headers: listed).status, 101)
+    t2.number("ws unlisted", ask(router, "GET", "/open", headers: other).status, 403)
+
+    // compress leaves answers in pieces alone.
+    var squeezed = web.Router()
+    squeezed.use(web.compress(minimum: 0))
+    squeezed.get("/s") { r in web.events { out in out.end() } }
+    t2.check("no gzip on a stream", ask(squeezed, "GET", "/s", headers: ["Accept-Encoding": "gzip"]).header("content-encoding") == nil)
+
+    // One limit's clients don't push out another's.
+    var limits = web.Router()
+    limits.use(web.rateLimit(requests: 2, seconds: 3600, name: "login test"))
+    limits.get("/") { r in web.text("ok") }
+    var api = web.Router()
+    api.use(web.rateLimit(requests: 1000, seconds: 0.001, key: { r in r.queryValue("k") ?? "" }, maxClients: 5, name: "api test"))
+    api.get("/") { r in web.text("ok") }
+    t2.same("login first two", "{ask(limits, "GET", "/").status} {ask(limits, "GET", "/").status}", "200 200")
+    t2.number("login limited", ask(limits, "GET", "/").status, 429)
+    for i in 0..300 {
+        t2.number("api {i}", ask(api, "GET", "/?k={i}").status, 200)
+    }
+    t2.number("login still limited", ask(limits, "GET", "/").status, 429)
+
+    // A session ended while a request was on its way isn't brought back.
+    let store = web.memoryStore(name: "replace test")
+    store.save("abc", web.StoredSession(values: ["user": "ann"], expires: now() + 60))
+    if let replace = store.replace {
+        t2.check("replace kept", replace("abc", web.StoredSession(values: ["user": "ann", "n": "1"], expires: now() + 60)))
+        store.remove("abc")
+        t2.check("replace refused", !replace("abc", web.StoredSession(values: ["user": "ann"], expires: now() + 60)))
+        t2.check("still gone", store.load("abc") == nil)
+    } else {
+        t2.check("memory store replaces", false)
+    }
+    t2
+}
+
 fn sessions(_ t: Tally) -> Tally {
     var t2 = t
     var router = web.Router()
@@ -705,11 +765,12 @@ fn stores(_ t: Tally) -> Tally {
     t2.number("no sessions", store.count(), 0)
     t2.same("unsigned id refused", ask(router, "GET", "/", headers: ["Cookie": "session={c3.substring(from: 0, to: c3.findLast(".") ?? 0)}"]).text(), "user=none")
 
-    let small = web.memoryStore(limit: 10, name: "limit test")
-    for i in 0..25 {
+    // (Kept in 64 parts, each with its share of the limit.)
+    let small = web.memoryStore(limit: 1024, name: "limit test")
+    for i in 0..3000 {
         small.save("id{i}", web.StoredSession(values: ["n": "{i}"], expires: now() + Float(100 + i)))
     }
-    t2.check("store limit", small.count() <= 10 && small.load("id24") != nil && small.load("id0") == nil)
+    t2.check("store limit", small.count() <= 1100 && small.load("id2999") != nil && small.load("id0") == nil)
 
     // In a database: a second store on the same file finds the session.
     let path = "tests/sessions-test.db"
@@ -1004,6 +1065,7 @@ fn main() {
     t = templates(t)
     t = security(t)
     t = stores(t)
+    t = hardening(t)
 
     // A route that answers later.
     var router = web.Router()
