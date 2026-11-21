@@ -1,0 +1,655 @@
+// web's tests. Run them from the library's folder: `tessel run tests`.
+// They check the router, requests and responses, the middleware, signing
+// (against RFC 4231 and Python's hmac), files, templates (3,000 cases
+// rendered by Handlebars, in templates.json, made by tools/oracle), and a
+// real server over TCP. Failures are printed, then a count; the exit
+// status is 1 if any check failed.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+import ".."
+
+// Checks, counted.
+struct Tally {
+    passed: Int = 0
+    failed: Int = 0
+
+    fn check(_ name: String, _ ok: Bool) {
+        if ok {
+            passed += 1
+        } else {
+            failed += 1
+            print("FAIL  {name}")
+        }
+    }
+
+    fn same(_ name: String, _ got: String, _ expected: String) {
+        if got == expected {
+            passed += 1
+        } else {
+            failed += 1
+            print("FAIL  {name}\n  got:      {toJson(got)}\n  expected: {toJson(expected)}")
+        }
+    }
+
+    fn number(_ name: String, _ got: Int, _ expected: Int) {
+        same(name, "{got}", "{expected}")
+    }
+}
+
+// A request through a router, answered at once.
+fn ask(_ router: web.Router, _ method: String, _ path: String, body: String = "",
+       headers: [String: String] = [:]) -> web.Response {
+    web.call(router, method, path, body: body, headers: headers) ?? web.text("answered later", status: 599)
+}
+
+fn routing(_ t: Tally) -> Tally {
+    var t2 = t
+    var router = web.Router()
+    router.get("/") { r in web.text("home") }
+    router.get("/users/new") { r in web.text("new form") }
+    router.get("/users/:id") { r in web.text("user {r.param("id")}") }
+    router.get("/users/:id/posts/:post") { r in web.text("{r.param("id")}/{r.param("post")}") }
+    router.get("/files/*rest") { r in web.text("rest=" + r.param("rest")) }
+    router.get("/:page") { r in web.text("page {r.param("page")}") }
+    router.post("/users") { r in web.text("created", status: 201) }
+    router.put("/users/:id") { r in web.text("put") }
+    router.patch("/users/:id") { r in web.text("patch") }
+    router.delete("/users/:id") { r in web.status(204) }
+    router.any("/echo") { r in web.text(r.method) }
+    router.add("report", "/report") { r in web.text("custom method") }
+
+    t2.same("root", ask(router, "GET", "/").text(), "home")
+    t2.same("fixed beats param", ask(router, "GET", "/users/new").text(), "new form")
+    t2.same("param", ask(router, "GET", "/users/42").text(), "user 42")
+    t2.same("param decoded", ask(router, "GET", "/users/ann%20lee").text(), "user ann lee")
+    t2.same("plus stays", ask(router, "GET", "/users/a+b").text(), "user a+b")
+    t2.same("two params", ask(router, "GET", "/users/7/posts/9").text(), "7/9")
+    t2.same("trailing slash", ask(router, "GET", "/users/7/").text(), "user 7")
+    t2.same("double slash", ask(router, "GET", "//users//7").text(), "user 7")
+    t2.same("wildcard", ask(router, "GET", "/files/a/b/c.txt").text(), "rest=a/b/c.txt")
+    t2.same("wildcard empty", ask(router, "GET", "/files").text(), "rest=")
+    t2.same("param before wildcard", ask(router, "GET", "/about").text(), "page about")
+    t2.number("post", ask(router, "POST", "/users").status, 201)
+    t2.same("put", ask(router, "PUT", "/users/1").text(), "put")
+    t2.same("patch", ask(router, "PATCH", "/users/1").text(), "patch")
+    t2.number("delete", ask(router, "DELETE", "/users/1").status, 204)
+    t2.same("lowercase method", ask(router, "delete", "/users/1").text(), "")
+    t2.same("any", ask(router, "PROPFIND", "/echo").text(), "PROPFIND")
+    t2.same("custom method", ask(router, "REPORT", "/report").text(), "custom method")
+    t2.same("query ignored", ask(router, "GET", "/users/5?x=1").text(), "user 5")
+
+    let head = ask(router, "HEAD", "/users/3")
+    t2.check("HEAD uses GET", head.status == 200 && head.text() == "user 3")
+    let missing = ask(router, "GET", "/a/b/c/d")
+    t2.check("404", missing.status == 404 && missing.text() == "Not Found")
+    let wrong = ask(router, "POST", "/users/3")
+    t2.number("405", wrong.status, 405)
+    t2.same("405 Allow", wrong.header("allow") ?? "", "DELETE, GET, HEAD, OPTIONS, PATCH, PUT")
+    let options = ask(router, "OPTIONS", "/users/3")
+    t2.number("OPTIONS", options.status, 204)
+    t2.same("OPTIONS Allow", options.header("Allow") ?? "", "DELETE, GET, HEAD, OPTIONS, PATCH, PUT")
+
+    router.notFound { r in web.html("<p>no {r.path}</p>", status: 404) }
+    t2.same("own 404", ask(router, "GET", "/x/y/z").text(), "<p>no /x/y/z</p>")
+
+    // Mounting, and middleware for some routes only.
+    var api = web.Router()
+    api.use(web.onResponse { r, res in res.withHeader("X-Api", "1") })
+    api.get("/") { r in web.json(["root": true]) }
+    api.get("/items/:id") { r in web.json(["id": r.param("id")]) }
+    var site = web.Router()
+    site.get("/") { r in web.text("site") }
+    site.mount("/api/v1/", api)
+    site.mount("", api)
+    let item = ask(site, "GET", "/api/v1/items/3")
+    t2.same("mounted", item.text(), "\{\"id\":\"3\"}")
+    t2.same("mounted middleware", item.header("x-api") ?? "", "1")
+    t2.same("mounted root", ask(site, "GET", "/api/v1").text(), "\{\"root\":true}")
+    t2.same("mounted at top", ask(site, "GET", "/items/4").text(), "\{\"id\":\"4\"}")
+    t2.same("not on other routes", ask(site, "GET", "/").header("x-api") ?? "none", "none")
+    t2.same("not on 404", ask(site, "GET", "/nothing/here").header("x-api") ?? "none", "none")
+    t2
+}
+
+fn middleware(_ t: Tally) -> Tally {
+    var t2 = t
+    var order: [String] = []
+    var router = web.Router()
+    router.use(web.Middleware(before: { r in
+        order.append("before 1")
+        var q = r
+        q.values["who"] = "ann"
+        web.next(q)
+    }, after: { r, res in
+        order.append("after 1")
+        res.withHeader("X-Who", r.values["who"] ?? "")
+    }))
+    router.use(web.Middleware(before: { r in
+        order.append("before 2")
+        if r.path == "/blocked" {
+            return web.stop(web.status(403))
+        }
+        web.next(r)
+    }, after: { r, res in
+        order.append("after 2")
+        res
+    }))
+    router.get("/hello") { r in
+        order.append("handler")
+        web.text("hello {r.values["who"] ?? "?"}")
+    }
+    let hello = ask(router, "GET", "/hello")
+    t2.same("value from middleware", hello.text(), "hello ann")
+    t2.same("order", order.joined(separator: ", "), "before 1, before 2, handler, after 2, after 1")
+    t2.same("after sees request", hello.header("X-Who") ?? "", "ann")
+    order = []
+    let blocked = ask(router, "GET", "/blocked")
+    t2.number("stopped", blocked.status, 403)
+    t2.same("stop order", order.joined(separator: ", "), "before 1, before 2, after 2, after 1")
+    order = []
+    t2.number("middleware on 404", ask(router, "GET", "/none").status, 404)
+    t2.same("404 order", order.joined(separator: ", "), "before 1, before 2, after 2, after 1")
+
+    // CORS.
+    var open = web.Router()
+    open.use(web.cors())
+    open.get("/data") { r in web.json([1, 2]) }
+    let simple = ask(open, "GET", "/data", headers: ["Origin": "https://a.example"])
+    t2.same("cors any", simple.header("access-control-allow-origin") ?? "", "*")
+    t2.same("cors no origin", ask(open, "GET", "/data").header("access-control-allow-origin") ?? "none", "none")
+    let pre = ask(open, "OPTIONS", "/data", headers: ["Origin": "https://a.example", "Access-Control-Request-Method": "PUT",
+                                                    "Access-Control-Request-Headers": "content-type"])
+    t2.number("preflight", pre.status, 204)
+    t2.same("preflight methods", pre.header("access-control-allow-methods") ?? "", "GET, HEAD, POST, PUT, PATCH, DELETE")
+    t2.same("preflight headers", pre.header("access-control-allow-headers") ?? "", "content-type")
+    t2.same("preflight max age", pre.header("access-control-max-age") ?? "", "600")
+    var some = web.Router()
+    some.use(web.cors(origins: ["https://good.example"], credentials: true))
+    some.get("/data") { r in web.text("ok") }
+    let good = ask(some, "GET", "/data", headers: ["Origin": "https://good.example"])
+    t2.same("cors listed", good.header("access-control-allow-origin") ?? "", "https://good.example")
+    t2.same("cors credentials", good.header("access-control-allow-credentials") ?? "", "true")
+    t2.same("cors vary", good.header("vary") ?? "", "Origin")
+    let bad = ask(some, "GET", "/data", headers: ["Origin": "https://bad.example"])
+    t2.same("cors not listed", bad.header("access-control-allow-origin") ?? "none", "none")
+    let badPre = ask(some, "OPTIONS", "/data", headers: ["Origin": "https://bad.example", "Access-Control-Request-Method": "GET"])
+    t2.check("preflight refused", badPre.status == 204 && badPre.header("access-control-allow-origin") == nil)
+
+    // Basic authentication.
+    var locked = web.Router()
+    locked.use(web.basicAuth(realm: "Staff \"only\"") { user, password in user == "ann" && password == "pa:ss" })
+    locked.get("/") { r in web.text("hi {r.values["user"] ?? ""}") }
+    let refused = ask(locked, "GET", "/")
+    t2.number("auth 401", refused.status, 401)
+    t2.same("auth realm", refused.header("www-authenticate") ?? "", "Basic realm=\"Staff 'only'\", charset=\"UTF-8\"")
+    let token = Data(text: "ann:pa:ss").base64
+    t2.same("auth ok", ask(locked, "GET", "/", headers: ["Authorization": "Basic {token}"]).text(), "hi ann")
+    let wrongToken = Data(text: "ann:nope").base64
+    t2.number("auth wrong", ask(locked, "GET", "/", headers: ["Authorization": "Basic {wrongToken}"]).status, 401)
+    t2.number("auth junk", ask(locked, "GET", "/", headers: ["Authorization": "Basic !!!"]).status, 401)
+
+    // Compression.
+    var small = web.Router()
+    small.use(web.compress())
+    let long = "<p>Tessel</p>".repeated(200)
+    small.get("/long") { r in web.html(long) }
+    small.get("/short") { r in web.html("<p>hi</p>") }
+    small.get("/png") { r in web.bytes(Data(text: long), type: "image/png") }
+    let zipped = ask(small, "GET", "/long", headers: ["Accept-Encoding": "br, gzip;q=0.8"])
+    t2.same("gzip header", zipped.header("content-encoding") ?? "", "gzip")
+    t2.same("gzip vary", zipped.header("vary") ?? "", "Accept-Encoding")
+    t2.check("gzip smaller", zipped.body.count < long.count / 10)
+    t2.same("gzip round trip", zipped.body.decompressed("gzip")?.text ?? "", long)
+    t2.check("no gzip without asking", ask(small, "GET", "/long").header("content-encoding") == nil)
+    t2.check("no gzip q=0", ask(small, "GET", "/long", headers: ["Accept-Encoding": "gzip;q=0"]).header("content-encoding") == nil)
+    t2.check("no gzip short", ask(small, "GET", "/short", headers: ["Accept-Encoding": "gzip"]).header("content-encoding") == nil)
+    t2.check("no gzip png", ask(small, "GET", "/png", headers: ["Accept-Encoding": "gzip"]).header("content-encoding") == nil)
+
+    // Security headers and the body limit.
+    var safe = web.Router()
+    safe.use(web.securityHeaders(contentSecurityPolicy: "default-src 'self'"))
+    safe.use(web.bodyLimit(10))
+    safe.post("/") { r in web.text("ok").withHeader("X-Frame-Options", "SAMEORIGIN") }
+    let secured = ask(safe, "POST", "/", body: "short")
+    t2.same("nosniff", secured.header("x-content-type-options") ?? "", "nosniff")
+    t2.same("own frame option kept", secured.header("x-frame-options") ?? "", "SAMEORIGIN")
+    t2.same("csp", secured.header("content-security-policy") ?? "", "default-src 'self'")
+    t2.number("body limit", ask(safe, "POST", "/", body: "more than ten bytes").status, 413)
+
+    // The logger passes answers through unchanged.
+    var logged = web.Router()
+    logged.use(web.logger())
+    logged.get("/") { r in web.text("logged") }
+    t2.same("logger", ask(logged, "GET", "/").text(), "logged")
+    t2
+}
+
+fn requests(_ t: Tally) -> Tally {
+    var t2 = t
+    let r = web.Request(method: "GET", path: "/search", query: "q=fish+%26+chips&tag=a&tag=b&empty=&flag&%C3%A9=%E2%9C%93",
+                        headers: ["content-type": "text/plain; charset=utf-8", "accept": "text/html, application/json;q=0.5, */*;q=0"])
+    t2.same("query value", r.queryValue("q") ?? "", "fish & chips")
+    t2.same("query repeated", r.queryValues("tag").joined(separator: ","), "a,b")
+    t2.same("query empty", r.queryValue("empty") ?? "nil", "")
+    t2.same("query bare", r.queryValue("flag") ?? "nil", "")
+    t2.same("query missing", r.queryValue("nope") ?? "nil", "nil")
+    t2.same("query unicode", r.queryValue("é") ?? "", "✓")
+    t2.same("query dict", r.queryDict()["tag"] ?? "", "b")
+    t2.same("header any case", r.header("Content-Type") ?? "", "text/plain; charset=utf-8")
+    t2.same("content type", r.contentType(), "text/plain")
+    t2.check("accepts html", r.accepts("text/html"))
+    t2.check("accepts json", r.accepts("application/json"))
+    t2.check("refuses xml (q=0)", !r.accepts("application/xml"))
+    t2.check("no Accept takes all", web.Request().accepts("image/png"))
+
+    let form = web.Request(method: "POST", headers: ["content-type": "application/x-www-form-urlencoded"],
+                           body: Data(text: "name=Ann+Lee&city=S%C3%A3o+Paulo&note=a%3Db"))
+    t2.same("form", toJson(form.form().keys.sorted()), "[\"city\",\"name\",\"note\"]")
+    t2.same("form plus", form.form()["name"] ?? "", "Ann Lee")
+    t2.same("form decoded", form.form()["city"] ?? "", "São Paulo")
+    t2.same("form equals", form.form()["note"] ?? "", "a=b")
+    t2.check("form needs its type", web.Request(body: Data(text: "a=1")).form().isEmpty)
+
+    // Multipart: a field and a file.
+    var body = Data(text: "--XyZ\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello there\r\n")
+    body += Data(text: "--XyZ\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"a b.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n")
+    body += Data(bytes: [0, 1, 2, 13, 10, 45, 45, 255])
+    body += Data(text: "\r\n--XyZ\r\nContent-Disposition: form-data; name=\"empty\"\r\n\r\n\r\n--XyZ--\r\n")
+    let upload = web.Request(method: "POST", headers: ["content-type": "multipart/form-data; boundary=\"XyZ\""], body: body)
+    let parts = upload.parts()
+    t2.number("parts", parts.count, 3)
+    t2.same("multipart field", upload.form()["title"] ?? "", "Hello there")
+    t2.same("multipart empty field", upload.form()["empty"] ?? "nil", "")
+    if let photo = upload.file("photo") {
+        t2.same("file name", photo.fileName ?? "", "a b.bin")
+        t2.same("file type", photo.contentType, "application/octet-stream")
+        t2.same("file bytes", toJson(photo.data.bytes), "[0,1,2,13,10,45,45,255]")
+    } else {
+        t2.check("file found", false)
+    }
+    t2.check("no file for a field", upload.file("title") == nil)
+
+    let jar = web.Request(headers: ["cookie": "a=1; b=\"quoted\"; c=two%20words; a=2;broken; d=; e=ab+c/d=="])
+    t2.same("cookie", jar.cookie("a") ?? "", "1")
+    t2.same("cookie quoted", jar.cookie("b") ?? "", "quoted")
+    t2.same("cookie decoded", jar.cookie("c") ?? "", "two words")
+    t2.same("cookie empty", jar.cookie("d") ?? "nil", "")
+    t2.same("cookie plus and equals", jar.cookie("e") ?? "", "ab+c/d==")
+    t2.check("cookie missing", jar.cookie("broken") == nil)
+
+    let posted = web.Request(method: "POST", body: Data(text: "\{\"name\": \"Ann\", \"age\": 31}"))
+    let person: Person? = web.readJson(posted)
+    t2.same("json body", person?.name ?? "", "Ann")
+    let bad: Person? = web.readJson(web.Request(body: Data(text: "not json")))
+    t2.check("json body bad", bad == nil)
+    t2
+}
+
+struct Person {
+    name: String
+    age: Int
+}
+
+fn responses(_ t: Tally) -> Tally {
+    var t2 = t
+    let j = web.json(Person(name: "Ann", age: 3), status: 201)
+    t2.same("json", j.text(), "\{\"name\":\"Ann\",\"age\":3}")
+    t2.same("json type", j.header("content-type") ?? "", "application/json")
+    t2.number("json status", j.status, 201)
+    t2.same("html type", web.html("x").header("Content-Type") ?? "", "text/html; charset=utf-8")
+    t2.same("text type", web.text("x").header("Content-Type") ?? "", "text/plain; charset=utf-8")
+    let moved = web.redirect("/login?next=%2F", status: 303)
+    t2.check("redirect", moved.status == 303 && moved.header("location") == "/login?next=%2F")
+    t2.same("status text", web.status(404).text(), "Not Found")
+    t2.same("status message", web.status(400, "name is missing").text(), "name is missing")
+    t2.check("204 has no body", web.status(204).body.isEmpty)
+    t2.same("unknown status", web.statusText(299), "Status 299")
+    t2.same("withHeader replaces", toJson(web.text("x").withHeader("content-type", "a/b").headers), "\{\"content-type\":\"a/b\"}")
+    t2.same("http date", web.httpDate(0), "Thu, 01 Jan 1970 00:00:00 GMT")
+    t2.same("http date back", "{web.parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") ?? -1}", "784111777.0")
+
+    let c = web.text("x").withCookie("a", "1").withCookie("b", "two words; x", maxAge: 60, path: "/app",
+                                                          domain: "example.com", secure: true, sameSite: "Strict")
+    t2.number("cookies", c.cookies.count, 2)
+    t2.same("cookie line", c.cookies[0], "a=1; Path=/; HttpOnly; SameSite=Lax")
+    t2.check("cookie attributes", c.cookies[1].hasPrefix("b=two%20words%3B%20x; Max-Age=60; Expires=") &&
+             c.cookies[1].hasSuffix(" GMT; Path=/app; Domain=example.com; HttpOnly; Secure; SameSite=Strict"))
+    let replaced = c.withCookie("a", "3")
+    t2.same("cookie replaced", replaced.cookies.joined(separator: "|"), c.cookies[1] + "|a=3; Path=/; HttpOnly; SameSite=Lax")
+    t2.same("cookie removed", web.text("x").withoutCookie("a").cookies[0], "a=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/")
+    t2
+}
+
+fn signing(_ t: Tally) -> Tally {
+    var t2 = t
+    // RFC 4231 test cases 1, 2 and 6, and RFC 2202 case 2 for SHA-1.
+    var key1 = Data()
+    for _ in 0..20 {
+        key1.append(byte: 0x0b)
+    }
+    t2.same("hmac rfc4231 1", web.hmac(key: key1, message: Data(text: "Hi There")).hex,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+    t2.same("hmac rfc4231 2", web.hmac(key: Data(text: "Jefe"), message: Data(text: "what do ya want for nothing?")).hex,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    var key6 = Data()
+    for _ in 0..131 {
+        key6.append(byte: 0xaa)
+    }
+    t2.same("hmac rfc4231 6", web.hmac(key: key6, message: Data(text: "Test Using Larger Than Block-Size Key - Hash Key First")).hex,
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+    t2.same("hmac sha512", web.hmac(key: Data(text: "Jefe"), message: Data(text: "what do ya want for nothing?"), algorithm: "sha512").hex,
+            "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737")
+    t2.same("hmac sha1", web.hmac(key: Data(text: "Jefe"), message: Data(text: "what do ya want for nothing?"), algorithm: "sha1").hex,
+            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")
+    // Python: value + "." + urlsafe_b64encode(hmac.new(secret, value, sha256)) without "=".
+    t2.same("sign", web.sign("hello", secret: "0123456789abcdef0123"), "hello.hCaIDQdSE-X1UwXDmV1eO1nYvY8f70RyxZtxhXzKnNQ")
+    t2.same("sign long secret", web.sign("user=ann", secret: "a much longer secret, more than sixty-four bytes long, to be hashed first!!"),
+            "user=ann.QzaNHqhnmcQleErnZqdjpqWTuDyK7UH5zXIBhu_H2Jk")
+    t2.same("sign empty", web.sign("", secret: "kkkkkkkkkkkkkkkk"), ".CWwEY5jTujkHsbiM91f8rZLqy-HowR__WvDFLwE4-3s")
+    t2.same("sign unicode", web.sign("é ✓", secret: "secret-secret-secret"), "é ✓.NjksFedKeeHe1U4EQSQ0j_isRvTKYXlullbZ2mbNhXg")
+    t2.same("unsign", web.unsign("a.b.c." + web.sign("x.y", secret: "s").substring(from: 4, to: 100), secret: "s") ?? "nil", "nil")
+    t2.same("unsign good", web.unsign(web.sign("x.y", secret: "s"), secret: "s") ?? "nil", "x.y")
+    t2.check("unsign changed", web.unsign("hellp.hCaIDQdSE-X1UwXDmV1eO1nYvY8f70RyxZtxhXzKnNQ", secret: "0123456789abcdef0123") == nil)
+    t2.check("unsign other secret", web.unsign(web.sign("x", secret: "one"), secret: "two") == nil)
+    t2.check("unsign no dot", web.unsign("abc", secret: "s") == nil)
+    t2
+}
+
+fn sessions(_ t: Tally) -> Tally {
+    var t2 = t
+    var router = web.Router()
+    router.use(web.sessions(secret: "a secret of at least sixteen characters"))
+    router.post("/login") { r in web.redirect("/").withSession(["user": r.form()["user"] ?? ""]) }
+    router.get("/") { r in web.text("user={r.session["user"] ?? "none"}") }
+    router.post("/logout") { r in web.redirect("/").withSession([:]) }
+    let login = ask(router, "POST", "/login", body: "user=ann", headers: ["Content-Type": "application/x-www-form-urlencoded"])
+    t2.number("login cookie", login.cookies.count, 1)
+    let line = if login.cookies.isEmpty { "" } else { login.cookies[0] }
+    t2.check("session cookie flags", line.hasPrefix("session=") && line.contains("; Max-Age=1209600;") && line.contains("; HttpOnly"))
+    let value = line.substring(from: 8, to: line.find(";") ?? line.count)
+    t2.same("session read", ask(router, "GET", "/", headers: ["Cookie": "session={value}"]).text(), "user=ann")
+    t2.same("no session", ask(router, "GET", "/").text(), "user=none")
+    // Change one character of the signed value.
+    let dot = value.findLast(".") ?? 1
+    let first = value.substring(from: 0, to: 1)
+    let changed = (if first == "e" { "f" } else { "e" }) + value.substring(from: 1, to: value.count)
+    t2.check("value kept dot", dot > 1)
+    t2.same("session changed", ask(router, "GET", "/", headers: ["Cookie": "session={changed}"]).text(), "user=none")
+    t2.same("session junk", ask(router, "GET", "/", headers: ["Cookie": "session=junk"]).text(), "user=none")
+    let logout = ask(router, "POST", "/logout", headers: ["Cookie": "session={value}"])
+    t2.check("logout clears", logout.cookies.count == 1 && logout.cookies[0].hasPrefix("session=; Max-Age=0"))
+    t2.number("untouched session sends no cookie", ask(router, "GET", "/", headers: ["Cookie": "session={value}"]).cookies.count, 0)
+
+    var expired = web.Router()
+    expired.use(web.sessions(secret: "a secret of at least sixteen characters", maxAge: 0))
+    expired.post("/login") { r in web.text("ok").withSession(["user": "ann"]) }
+    expired.get("/") { r in web.text("user={r.session["user"] ?? "none"}") }
+    let short = ask(expired, "POST", "/login")
+    let c = if short.cookies.isEmpty { "" } else { short.cookies[0] }
+    let v = c.substring(from: 8, to: c.find(";") ?? c.count)
+    t2.same("session expired", ask(expired, "GET", "/", headers: ["Cookie": "session={v}"]).text(), "user=none")
+    t2
+}
+
+fn files(_ t: Tally) -> Tally {
+    var t2 = t
+    var router = web.Router()
+    router.files("/static", folder: "tests/site")
+    router.files("/cached", folder: "tests/site", options: web.FileOptions(index: "", maxAge: 3600))
+    router.get("/download") { r in web.file("tests/site/two words.csv", r, download: "report 1.csv") }
+
+    let css = ask(router, "GET", "/static/css/site.css")
+    t2.same("css", css.text(), "body \{ color: #222; }\n")
+    t2.same("css type", css.header("content-type") ?? "", "text/css; charset=utf-8")
+    t2.same("no-cache", css.header("cache-control") ?? "", "no-cache")
+    t2.same("ranges", css.header("accept-ranges") ?? "", "bytes")
+    let tag = css.header("etag") ?? ""
+    t2.check("etag", tag.hasPrefix("\"") && tag.hasSuffix("\""))
+    let modified = css.header("last-modified") ?? ""
+    t2.check("last modified", modified.hasSuffix(" GMT"))
+
+    let again = ask(router, "GET", "/static/css/site.css", headers: ["If-None-Match": tag])
+    t2.check("304 etag", again.status == 304 && again.body.isEmpty && again.header("etag") == tag)
+    t2.number("304 weak etag", ask(router, "GET", "/static/css/site.css", headers: ["If-None-Match": "\"x\", W/{tag}"]).status, 304)
+    t2.number("200 other etag", ask(router, "GET", "/static/css/site.css", headers: ["If-None-Match": "\"other\""]).status, 200)
+    t2.number("304 date", ask(router, "GET", "/static/css/site.css", headers: ["If-Modified-Since": modified]).status, 304)
+    t2.number("200 old date", ask(router, "GET", "/static/css/site.css", headers: ["If-Modified-Since": "Thu, 01 Jan 1970 00:00:00 GMT"]).status, 200)
+    t2.number("etag wins over date", ask(router, "GET", "/static/css/site.css",
+                                       headers: ["If-None-Match": "\"other\"", "If-Modified-Since": modified]).status, 200)
+
+    let part = ask(router, "GET", "/static/numbers.bin", headers: ["Range": "bytes=10-13"])
+    t2.number("206", part.status, 206)
+    t2.same("206 bytes", toJson(part.body.bytes), "[10,11,12,13]")
+    t2.same("206 range", part.header("content-range") ?? "", "bytes 10-13/1024")
+    t2.same("suffix range", toJson(ask(router, "GET", "/static/numbers.bin", headers: ["Range": "bytes=-3"]).body.bytes), "[253,254,255]")
+    t2.number("open range", ask(router, "GET", "/static/numbers.bin", headers: ["Range": "bytes=1000-"]).body.count, 24)
+    t2.number("range past end", ask(router, "GET", "/static/numbers.bin", headers: ["Range": "bytes=1020-5000"]).body.count, 4)
+    let unsatisfiable = ask(router, "GET", "/static/numbers.bin", headers: ["Range": "bytes=2000-"])
+    t2.check("416", unsatisfiable.status == 416 && unsatisfiable.header("content-range") == "bytes */1024")
+    t2.number("several ranges send all", ask(router, "GET", "/static/numbers.bin", headers: ["Range": "bytes=0-1,5-6"]).body.count, 1024)
+    t2.number("bad range sends all", ask(router, "GET", "/static/numbers.bin", headers: ["Range": "lines=1-2"]).status, 200)
+    t2.number("if-range old", ask(router, "GET", "/static/numbers.bin", headers: ["Range": "bytes=0-1", "If-Range": "\"old\""]).status, 200)
+    let binTag = ask(router, "HEAD", "/static/numbers.bin").header("etag") ?? ""
+    t2.number("if-range current", ask(router, "GET", "/static/numbers.bin", headers: ["Range": "bytes=0-1", "If-Range": binTag]).status, 206)
+
+    let head = ask(router, "HEAD", "/static/numbers.bin")
+    t2.check("HEAD", head.status == 200 && head.body.isEmpty && head.header("content-length") == "1024")
+    t2.same("binary type", head.header("content-type") ?? "", "application/octet-stream")
+
+    let folder = ask(router, "GET", "/static/docs?x=1")
+    t2.check("folder redirect", folder.status == 301 && folder.header("location") == "/static/docs/?x=1")
+    t2.number("folder without index", ask(router, "GET", "/static/docs/").status, 404)
+    t2.same("index", ask(router, "GET", "/static/").text(), "<!doctype html>\n<h1>Home</h1>\n")
+    t2.same("index without slash", ask(router, "GET", "/static").header("location") ?? "", "/static/")
+    t2.same("space in name", ask(router, "GET", "/static/two%20words.csv").text(), "a,b\n1,2\n")
+    t2.same("csv type", ask(router, "GET", "/static/two%20words.csv").header("content-type") ?? "", "text/csv; charset=utf-8")
+    t2.number("hidden file", ask(router, "GET", "/static/.env").status, 404)
+    t2.number("dot dot", ask(router, "GET", "/static/../README.md").status, 404)
+    t2.number("encoded dot dot", ask(router, "GET", "/static/%2e%2e/README.md").status, 404)
+    t2.number("encoded slash", ask(router, "GET", "/static/css%2Fsite.css").status, 404)
+    t2.number("backslash", ask(router, "GET", "/static/css%5Csite.css").status, 404)
+    t2.number("missing file", ask(router, "GET", "/static/nope.txt").status, 404)
+    t2.number("POST to files", ask(router, "POST", "/static/index.html").status, 405)
+    t2.number("no index option", ask(router, "GET", "/cached/").status, 404)
+    t2.same("max age", ask(router, "GET", "/cached/index.html").header("cache-control") ?? "", "public, max-age=3600")
+    let download = ask(router, "GET", "/download")
+    t2.same("download", download.header("content-disposition") ?? "", "attachment; filename=\"report 1.csv\"; filename*=UTF-8''report%201.csv")
+
+    t2.same("type html", web.contentType("a/b/Page.HTML"), "text/html; charset=utf-8")
+    t2.same("type svg", web.contentType("logo.svg"), "image/svg+xml; charset=utf-8")
+    t2.same("type woff2", web.contentType("f.woff2"), "font/woff2")
+    t2.same("type unknown", web.contentType("x.qqq"), "application/octet-stream")
+    t2.same("type none", web.contentType("Makefile"), "application/octet-stream")
+    t2
+}
+
+// The file of Handlebars cases.
+struct OracleFile {
+    data: String
+    partials: [String: String]
+    cases: [OracleCase]
+}
+
+struct OracleCase {
+    name: String
+    template: String
+    out: String
+    error: Bool
+}
+
+fn templates(_ t: Tally) -> Tally {
+    var t2 = t
+    let file: OracleFile? = fromJson(readFile("tests/templates.json") ?? "")
+    if let oracle = file {
+        var mismatches = 0
+        for c in oracle.cases {
+            var texts = oracle.partials
+            texts["main"] = c.template
+            match web.parseTemplates(texts) {
+                .ok(set) -> {
+                    if c.error {
+                        t2.check("{c.name}: Handlebars refuses it", false)
+                    } else {
+                        let got = web.renderJson(set, "main", oracle.data)
+                        if got != c.out {
+                            mismatches += 1
+                            if mismatches <= 10 {
+                                t2.same("handlebars {c.name}: {toJson(c.template)}", got, c.out)
+                            } else {
+                                t2.check(c.name, false)
+                            }
+                        } else {
+                            t2.check(c.name, true)
+                        }
+                    }
+                }
+                .failure(e) -> t2.check("{c.name}: {e.message}", c.error)
+            }
+        }
+        t2.check("oracle cases", oracle.cases.count > 3000)
+    } else {
+        t2.check("tests/templates.json read", false)
+    }
+
+    // What Handlebars writes differently, and web's own additions.
+    let one = web.parseTemplates(["main": "\{\{items.0}}\{\{items.2}}[\{\{items.9}}] \{\{items.count}} \{\{name.count}}"])
+    match one {
+        .ok(set) -> t2.same("indexes and counts", web.render(set, "main", Lists(items: ["a", "b", "c"], name: "héllo")), "ac[] 3 5")
+        .failure(e) -> t2.check(e.message, false)
+    }
+    match web.parseTemplates(["main": "\{\{price}} \{\{whole}} \{\{list}}"]) {
+        .ok(set) -> t2.same("numbers as Tessel writes them", web.render(set, "main", Numbers(price: 2.0, whole: 7, list: [1, 2])), "2.0 7 [1,2]")
+        .failure(e) -> t2.check(e.message, false)
+    }
+
+    // Errors, with lines.
+    let bad = [
+        ("\{\{#if a}}\nx", "t: \{\{#if}} isn't closed with \{\{/if}}"),
+        ("a\n\n\{\{#if a}}x\{\{/each}}", "t line 3: \{\{/each}} closes \{\{#if}} from line 3"),
+        ("x\{\{/if}}", "t line 1: \{\{/if}} has no block to end"),
+        ("\{\{else}}", "t line 1: \{\{else}} has no block to end"),
+        ("a\n\{\{name", "t line 2: this tag isn't closed with }}"),
+        ("\{\{\{name}}", "t line 1: this tag isn't closed with }}}"),
+        ("\{\{#loop x}}\{\{/loop}}", "t line 1: \{\{#loop}} isn't a block (there are if, unless, each and with)"),
+        ("\{\{#each}}\{\{/each}}", "t line 1: \{\{#each}} needs a value: \{\{#each items}}"),
+        ("\{\{#each xs as item}}\{\{/each}}", "t line 1: can't read \{\{#each xs as item}}"),
+        ("\{\{#if a}}\{\{else}}\{\{else}}\{\{/if}}", "t line 1: a second \{\{else}} in \{\{#if}}"),
+        ("\{\{#each a}}\{\{else if b}}\{\{/each}}", "t line 1: can't read \{\{else if b}}"),
+        ("\{\{}}", "t line 1: an empty tag"),
+        ("\{\{> }}", "t line 1: \{\{>}} needs a template's name"),
+    ]
+    for (text, message) in bad {
+        match web.parseTemplates(["t": text]) {
+            .ok(_) -> t2.check("refused: {text}", false)
+            .failure(e) -> t2.same("error for {toJson(text)}", e.message, message)
+        }
+    }
+
+    // A folder of templates, with a layout.
+    match web.loadTemplates("tests/views") {
+        .ok(set) -> {
+            t2.same("names", toJson(set.names()), "[\"layout\",\"users/list\",\"users/row\"]")
+            let people = Page(title: "People & co", users: [User(name: "Ann", admin: true), User(name: "<Bo>", admin: false)])
+            t2.same("layout", web.render(set, "users/list", people, layout: "layout"),
+                    "<!doctype html>\n<title>People &amp; co</title>\n<main>\n<h1>People &amp; co</h1>\n<ul>\n  <li>Ann (admin)</li>\n  <li>&lt;Bo&gt;</li>\n</ul>\n\n</main>\n")
+            t2.same("empty list", web.render(set, "users/list", Page(title: "None", users: [])),
+                    "<h1>None</h1>\n<ul>\n  <li>No users yet</li>\n</ul>\n")
+            let answer = web.page(set, "users/list", people)
+            t2.check("page", answer.status == 200 && answer.header("content-type") == "text/html; charset=utf-8")
+            t2.number("page missing", web.page(set, "nope", people).status, 500)
+            t2.number("layout missing", web.page(set, "users/list", people, layout: "nope").status, 500)
+        }
+        .failure(e) -> t2.check(e.message, false)
+    }
+    match web.loadTemplates("tests/nowhere") {
+        .ok(_) -> t2.check("missing folder refused", false)
+        .failure(e) -> t2.same("missing folder", e.message, "can't read the templates: tests/nowhere isn't a folder")
+    }
+    t2.same("escape", web.escapeHtml("<a href=\"x\">'&`</a>"), "&lt;a href&#x3D;&quot;x&quot;&gt;&#x27;&amp;&#x60;&lt;/a&gt;")
+    t2
+}
+
+struct Lists {
+    items: [String]
+    name: String
+}
+
+struct Numbers {
+    price: Float
+    whole: Int
+    list: [Int]
+}
+
+struct User {
+    name: String
+    admin: Bool
+}
+
+struct Page {
+    title: String
+    users: [User]
+}
+
+// Prints the count and ends the program.
+fn finish(_ t: Tally) {
+    print("{t.passed} passed, {t.failed} failed")
+    if t.failed > 0 {
+        exit(1)
+    }
+}
+
+fn main() {
+    var t = Tally()
+    t = routing(t)
+    t = middleware(t)
+    t = requests(t)
+    t = responses(t)
+    t = signing(t)
+    t = sessions(t)
+    t = files(t)
+    t = templates(t)
+
+    // A route that answers later.
+    var router = web.Router()
+    router.later("GET", "/slow") { r, reply in
+        after(seconds: 0.05) {
+            reply(web.text("slow {r.queryValue("n") ?? ""}"))
+        }
+    }
+    router.use(web.onResponse { r, res in res.withHeader("X-After", "yes") })
+    router.get("/cookies") { r in web.text("two").withCookie("a", "1").withCookie("b", "2") }
+    router.files("/", folder: "tests/site")
+    t.check("later isn't answered at once", web.call(router, "GET", "/slow") == nil)
+    router.handle(web.Request(method: "GET", path: "/slow", query: "n=1")) { res in
+        t.same("later answer", res.text(), "slow 1")
+        t.same("later after middleware", res.header("x-after") ?? "", "yes")
+
+        // A real server, over TCP.
+        let server = web.serve(router, port: 0)
+        t.check("serving", server > 0)
+        let port = tcpPort(server)
+        var received = Data()
+        var client = -1
+        client = connectTCP(host: "127.0.0.1", port: port, onConnect: {
+            sendTCP(client, data: Data(text: "GET /cookies HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+        }, onData: { data in
+            received += data
+        }) { reason in
+            let text = received.text ?? ""
+            t.check("status line", text.hasPrefix("HTTP/1.1 200 OK\r\n"))
+            t.check("two cookies on the wire", text.contains("\r\nSet-Cookie: a=1; Path=/; HttpOnly; SameSite=Lax\r\n") &&
+                    text.contains("\r\nset-Cookie: b=2; Path=/; HttpOnly; SameSite=Lax\r\n"))
+            request(url: "http://127.0.0.1:{port}/slow?n=2") { answer in
+                t.same("served later route", answer.text, "slow 2")
+                request(url: "http://127.0.0.1:{port}/numbers.bin", headers: ["Range": "bytes=0-2"]) { part in
+                    t.number("served range", part.status, 206)
+                    t.number("served range bytes", part.data.count, 3)
+                    stopHTTP(server)
+                    finish(t)
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,261 @@
+// web: sending files: a whole folder under a path (`router.files`), or
+// one file (`web.file`), with content types, caching (ETag and
+// Last-Modified, answered with 304 when the browser has the file already)
+// and byte ranges (for video and resumed downloads).
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// How a folder is served.
+public struct FileOptions {
+    // The file sent for a folder's address ("" for none).
+    index: String = "index.html"
+    // How long browsers may keep a file without asking again, in seconds.
+    // 0 makes them check with the server each time (a 304 if unchanged).
+    maxAge: Int = 0
+    // Whether names starting with "." (.env, .git) can be sent.
+    dotFiles: Bool = false
+}
+
+// The answer for a file of the folder: `rest` is the path below the
+// folder's prefix, still percent-encoded.
+fn folderFile(_ folder: String, _ request: Request, _ rest: [String], _ options: FileOptions) -> Response {
+    var names: [String] = []
+    for part in rest {
+        let name = pathDecoded(part)
+        if name == "." || name == ".." || name.contains("/") || name.contains("\\") || name.contains(":") {
+            return status(404)
+        }
+        if name.hasPrefix(".") && !options.dotFiles {
+            return status(404)
+        }
+        names.append(name)
+    }
+    var path = folder
+    for name in names {
+        path = joinPath(path, name)
+    }
+    if isFolder(path) {
+        if options.index.isEmpty {
+            return status(404)
+        }
+        if !request.path.hasSuffix("/") {
+            let target = if request.query.isEmpty { request.path + "/" } else { request.path + "/?" + request.query }
+            return redirect(target, status: 301)
+        }
+        path = joinPath(path, options.index)
+    }
+    if !fileExists(path) || isFolder(path) {
+        return status(404)
+    }
+    file(path, request, maxAge: options.maxAge)
+}
+
+// Sends a file: its type from its extension, with caching headers, and
+// only the bytes asked for when the request has a Range. `download` makes
+// browsers save it under that name instead of showing it.
+public fn file(_ path: String, _ request: Request, maxAge: Int = 0, download: String = "") -> Response {
+    let size = fileSize(path) ?? -1
+    if size < 0 || isFolder(path) {
+        return status(404)
+    }
+    let modified = Float(Int(modifiedTime(path) ?? 0))
+    let tag = "\"{hexNumber(size)}-{hexNumber(Int(modified))}\""
+    var headers: [String: String] = [
+        "Content-Type": contentType(path),
+        "Last-Modified": httpDate(modified),
+        "ETag": tag,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": if maxAge > 0 { "public, max-age={maxAge}" } else { "no-cache" },
+    ]
+    if !download.isEmpty {
+        let ascii = download.replace("\"", with: "'")
+        headers["Content-Disposition"] = "attachment; filename=\"{ascii}\"; filename*=UTF-8''{download.urlEncoded}"
+    }
+    if request.method != "GET" && request.method != "HEAD" {
+        return Response(status: 405, headers: ["Allow": "GET, HEAD"], body: Data(text: "Method Not Allowed"))
+    }
+    if notModified(request, tag, modified) {
+        var kept: [String: String] = [:]
+        for name in ["ETag", "Last-Modified", "Cache-Control"] {
+            kept[name] = headers[name] ?? ""
+        }
+        return Response(status: 304, headers: kept)
+    }
+    var from = 0
+    var count = size
+    var code = 200
+    if let range = request.header("range") {
+        if rangeApplies(request, tag, modified) {
+            if let (a, b) = byteRange(range, size) {
+                if a < 0 {
+                    var r = status(416)
+                    r.headers["Content-Range"] = "bytes */{size}"
+                    return r
+                }
+                from = a
+                count = b - a + 1
+                code = 206
+                headers["Content-Range"] = "bytes {a}-{b}/{size}"
+            }
+        }
+    }
+    if request.method == "HEAD" {
+        headers["Content-Length"] = "{count}"
+        return Response(status: code, headers: headers)
+    }
+    let body = if count == 0 { Data() } else { readData(path, from: from, count: count) ?? Data() }
+    Response(status: code, headers: headers, body: body)
+}
+
+// Whether the browser's copy is current: by If-None-Match when it's sent,
+// otherwise by If-Modified-Since.
+fn notModified(_ request: Request, _ tag: String, _ modified: Float) -> Bool {
+    if let tags = request.header("if-none-match") {
+        for t in tags.split(",") {
+            let given = t.trim()
+            if given == "*" || given == tag || given == "W/" + tag {
+                return true
+            }
+        }
+        return false
+    }
+    if let since = request.header("if-modified-since") {
+        if let t = parseHttpDate(since) {
+            return modified <= t
+        }
+    }
+    false
+}
+
+// Whether a Range should be used: always, unless an If-Range names an
+// older version of the file.
+fn rangeApplies(_ request: Request, _ tag: String, _ modified: Float) -> Bool {
+    if let ifRange = request.header("if-range") {
+        let given = ifRange.trim()
+        if given.hasPrefix("\"") || given.hasPrefix("W/") {
+            return given == tag
+        }
+        if let t = parseHttpDate(given) {
+            return modified <= t
+        }
+        return false
+    }
+    true
+}
+
+// The first and last byte of a single `bytes=` range in a file of `size`
+// bytes; (-1, -1) if it can't be satisfied; nil if it isn't a single byte
+// range (then the whole file is sent).
+fn byteRange(_ header: String, _ size: Int) -> (Int, Int)? {
+    let h = header.trim()
+    if !h.lowercase().hasPrefix("bytes=") {
+        return nil
+    }
+    let spec = h.substring(from: 6, to: h.count).trim()
+    if spec.contains(",") {
+        return nil
+    }
+    let dash = spec.find("-") ?? -1
+    if dash < 0 {
+        return nil
+    }
+    let first = spec.substring(from: 0, to: dash).trim()
+    let last = spec.substring(from: dash + 1, to: spec.count).trim()
+    if first.isEmpty {
+        // The last N bytes.
+        if let n = Int(last) {
+            if n <= 0 || size == 0 {
+                return (-1, -1)
+            }
+            return (max(size - n, 0), size - 1)
+        }
+        return nil
+    }
+    if let a = Int(first) {
+        if a < 0 {
+            return nil
+        }
+        if a >= size {
+            return (-1, -1)
+        }
+        if last.isEmpty {
+            return (a, size - 1)
+        }
+        if let b = Int(last) {
+            if b < a {
+                return nil
+            }
+            return (a, min(b, size - 1))
+        }
+    }
+    nil
+}
+
+fn hexNumber(_ n: Int) -> String {
+    if n <= 0 {
+        return "0"
+    }
+    let digits = "0123456789abcdef".characters
+    var out = ""
+    var v = n
+    while v > 0 {
+        out = digits[v % 16] + out
+        v = v / 16
+    }
+    out
+}
+
+// The content type for a file, by its extension: "text/html; charset=utf-8"
+// for page.html, "application/octet-stream" for one it doesn't know.
+public fn contentType(_ path: String) -> String {
+    let type = match path.fileExtension.lowercase() {
+        "html", "htm" -> "text/html"
+        "css" -> "text/css"
+        "js", "mjs", "cjs" -> "text/javascript"
+        "json", "map" -> "application/json"
+        "webmanifest" -> "application/manifest+json"
+        "txt", "text", "log" -> "text/plain"
+        "md", "markdown" -> "text/markdown"
+        "csv" -> "text/csv"
+        "tsv" -> "text/tab-separated-values"
+        "xml" -> "application/xml"
+        "rss" -> "application/rss+xml"
+        "atom" -> "application/atom+xml"
+        "yaml", "yml" -> "application/yaml"
+        "toml" -> "application/toml"
+        "ics" -> "text/calendar"
+        "svg" -> "image/svg+xml"
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "avif" -> "image/avif"
+        "ico" -> "image/x-icon"
+        "bmp" -> "image/bmp"
+        "tif", "tiff" -> "image/tiff"
+        "woff" -> "font/woff"
+        "woff2" -> "font/woff2"
+        "ttf" -> "font/ttf"
+        "otf" -> "font/otf"
+        "pdf" -> "application/pdf"
+        "zip" -> "application/zip"
+        "gz" -> "application/gzip"
+        "tar" -> "application/x-tar"
+        "wasm" -> "application/wasm"
+        "mp4", "m4v" -> "video/mp4"
+        "webm" -> "video/webm"
+        "mov" -> "video/quicktime"
+        "mp3" -> "audio/mpeg"
+        "m4a" -> "audio/mp4"
+        "ogg", "oga" -> "audio/ogg"
+        "opus" -> "audio/opus"
+        "wav" -> "audio/wav"
+        "flac" -> "audio/flac"
+        _ -> "application/octet-stream"
+    }
+    let text = type.hasPrefix("text/") || type == "application/json" || type == "application/xml" ||
+        type == "image/svg+xml" || type == "application/manifest+json" || type.hasSuffix("+xml") ||
+        type == "application/yaml" || type == "application/toml"
+    if text { type + "; charset=utf-8" } else { type }
+}

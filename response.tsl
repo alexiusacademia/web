@@ -1,0 +1,256 @@
+// web: the answer a handler gives, and the functions that make the usual
+// ones: text, HTML, JSON, bytes, redirects and bare statuses.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// An answer to a request.
+public struct Response {
+    status: Int = 200
+    // Header names as written; `Content-Length` is added when it's sent.
+    headers: [String: String] = [:]
+    body: Data = Data()
+    // The Set-Cookie lines to send, one for each cookie.
+    cookies: [String] = []
+    // The session to save, when the `sessions` middleware is used: nil
+    // keeps the request's session as it was.
+    session: [String: String]? = nil
+
+    // A header's value, by its name in any case.
+    fn header(_ name: String) -> String? {
+        let want = name.lowercase()
+        for (key, value) in headers {
+            if key.lowercase() == want {
+                return value
+            }
+        }
+        nil
+    }
+
+    // The same answer with a header set (replacing one of the same name in
+    // any case).
+    fn withHeader(_ name: String, _ value: String) -> Response {
+        var copy = self
+        copy.headers = withoutHeader(headers, name)
+        copy.headers[name] = value
+        copy
+    }
+
+    // The same answer with another status.
+    fn withStatus(_ status: Int) -> Response {
+        var copy = self
+        copy.status = status
+        copy
+    }
+
+    // The same answer, also setting a cookie in the browser. `maxAge` is
+    // in seconds (-1: until the browser closes). `sameSite` is "Lax",
+    // "Strict" or "None" ("None" needs `secure`).
+    fn withCookie(_ name: String, _ value: String, maxAge: Int = -1, path: String = "/",
+                  domain: String = "", httpOnly: Bool = true, secure: Bool = false,
+                  sameSite: String = "Lax") -> Response {
+        var line = "{name}={cookieValue(value)}"
+        if maxAge >= 0 {
+            line += "; Max-Age={maxAge}"
+            line += "; Expires=" + httpDate(now() + Float(maxAge))
+        }
+        if !path.isEmpty {
+            line += "; Path={path}"
+        }
+        if !domain.isEmpty {
+            line += "; Domain={domain}"
+        }
+        if httpOnly {
+            line += "; HttpOnly"
+        }
+        if secure {
+            line += "; Secure"
+        }
+        if !sameSite.isEmpty {
+            line += "; SameSite={sameSite}"
+        }
+        var copy = self
+        copy.cookies = cookies.filter { c in !c.hasPrefix(name + "=") }
+        copy.cookies.append(line)
+        copy
+    }
+
+    // The same answer, also removing a cookie from the browser. `path` and
+    // `domain` must be the ones it was set with.
+    fn withoutCookie(_ name: String, path: String = "/", domain: String = "") -> Response {
+        var line = "{name}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+        if !path.isEmpty {
+            line += "; Path={path}"
+        }
+        if !domain.isEmpty {
+            line += "; Domain={domain}"
+        }
+        var copy = self
+        copy.cookies = cookies.filter { c in !c.hasPrefix(name + "=") }
+        copy.cookies.append(line)
+        copy
+    }
+
+    // The same answer, saving `values` as the session (with the `sessions`
+    // middleware). An empty dictionary ends the session.
+    fn withSession(_ values: [String: String]) -> Response {
+        var copy = self
+        copy.session = values
+        copy
+    }
+
+    // The body as text ("" if it isn't UTF-8): for tests.
+    fn text() -> String {
+        body.text ?? ""
+    }
+}
+
+// Text, as `text/plain`.
+public fn text(_ text: String, status: Int = 200) -> Response {
+    Response(status: status, headers: ["Content-Type": "text/plain; charset=utf-8"], body: Data(text: text))
+}
+
+// A page of HTML.
+public fn html(_ html: String, status: Int = 200) -> Response {
+    Response(status: status, headers: ["Content-Type": "text/html; charset=utf-8"], body: Data(text: html))
+}
+
+// Any value as JSON: a struct, a list, a dictionary, a number…
+public fn json<T>(_ value: T, status: Int = 200) -> Response {
+    Response(status: status, headers: ["Content-Type": "application/json"], body: Data(text: toJson(value)))
+}
+
+// Bytes, with their content type.
+public fn bytes(_ data: Data, type: String = "application/octet-stream", status: Int = 200) -> Response {
+    Response(status: status, headers: ["Content-Type": type], body: data)
+}
+
+// Sends the browser to another address. 302 (the default) and 303 make
+// it ask with GET; 307 and 308 keep the method; 301 and 308 are for good.
+public fn redirect(_ to: String, status: Int = 302) -> Response {
+    Response(status: status, headers: ["Location": to])
+}
+
+// A status with a short text body: its reason ("Not Found") unless a
+// message is given. 204 and 304 have no body.
+public fn status(_ code: Int, _ message: String = "") -> Response {
+    if code == 204 || code == 304 || (code >= 100 && code < 200) {
+        return Response(status: code)
+    }
+    let shown = if message.isEmpty { statusText(code) } else { message }
+    text(shown, status: code)
+}
+
+// The reason phrase of a status: 404 gives "Not Found".
+public fn statusText(_ code: Int) -> String {
+    match code {
+        100 -> "Continue"
+        101 -> "Switching Protocols"
+        200 -> "OK"
+        201 -> "Created"
+        202 -> "Accepted"
+        204 -> "No Content"
+        206 -> "Partial Content"
+        301 -> "Moved Permanently"
+        302 -> "Found"
+        303 -> "See Other"
+        304 -> "Not Modified"
+        307 -> "Temporary Redirect"
+        308 -> "Permanent Redirect"
+        400 -> "Bad Request"
+        401 -> "Unauthorized"
+        403 -> "Forbidden"
+        404 -> "Not Found"
+        405 -> "Method Not Allowed"
+        406 -> "Not Acceptable"
+        408 -> "Request Timeout"
+        409 -> "Conflict"
+        410 -> "Gone"
+        411 -> "Length Required"
+        412 -> "Precondition Failed"
+        413 -> "Content Too Large"
+        415 -> "Unsupported Media Type"
+        416 -> "Range Not Satisfiable"
+        422 -> "Unprocessable Content"
+        429 -> "Too Many Requests"
+        500 -> "Internal Server Error"
+        501 -> "Not Implemented"
+        502 -> "Bad Gateway"
+        503 -> "Service Unavailable"
+        504 -> "Gateway Timeout"
+        _ -> "Status {code}"
+    }
+}
+
+// A time as HTTP writes it: "Sat, 21 Nov 2026 10:28:02 GMT".
+public fn httpDate(_ time: Float) -> String {
+    formatDate(time, format: "EEE, dd MMM yyyy HH:mm:ss", timeZone: "UTC") + " GMT"
+}
+
+// An HTTP date read back, or nil.
+public fn parseHttpDate(_ text: String) -> Float? {
+    let t = text.trim()
+    if t.hasSuffix(" GMT") {
+        return parseDate(t.substring(from: 0, to: t.count - 4), format: "EEE, dd MMM yyyy HH:mm:ss", timeZone: "UTC")
+    }
+    nil
+}
+
+// `headers` without any header named `name` in any case.
+fn withoutHeader(_ headers: [String: String], _ name: String) -> [String: String] {
+    let want = name.lowercase()
+    var out: [String: String] = [:]
+    for (key, value) in headers {
+        if key.lowercase() != want {
+            out[key] = value
+        }
+    }
+    out
+}
+
+// A cookie's value as sent: characters a cookie can't hold are
+// percent-encoded (and read back by `Request.cookies`).
+fn cookieValue(_ value: String) -> String {
+    var safe = true
+    for c in value.characters {
+        if c == ";" || c == "," || c == " " || c == "\"" || c == "\\" || c == "%" || c == "\t" {
+            safe = false
+        }
+    }
+    if safe {
+        return value
+    }
+    value.urlEncoded
+}
+
+// The headers to send: the answer's, plus one Set-Cookie for each cookie.
+// HTTP names are the same in any case and Tessel's server sends one line
+// for each name, so each cookie line goes under its own spelling of
+// Set-Cookie (Set-Cookie, set-Cookie, Set-cookie, …).
+fn wireHeaders(_ response: Response) -> [String: String] {
+    var out = withoutHeader(response.headers, "set-cookie")
+    var i = 0
+    for line in response.cookies {
+        out[cookieHeaderName(i)] = line
+        i += 1
+    }
+    out
+}
+
+// The i-th spelling of Set-Cookie: each bit of i lowers or raises one
+// letter. There are 2^9 of them.
+fn cookieHeaderName(_ i: Int) -> String {
+    let letters = "SetCookie".characters
+    let base = ["s", "e", "t", "c", "o", "o", "k", "i", "e"]
+    var name = ""
+    var k = 0
+    for letter in letters {
+        let lower = (i >> k) & 1 == 1
+        name += if lower { if letter == base[k] { letter.uppercase() } else { base[k] } } else { letter }
+        if k == 2 {
+            name += "-"
+        }
+        k += 1
+    }
+    name
+}

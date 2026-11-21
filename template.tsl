@@ -1,0 +1,700 @@
+// web: HTML templates, in the style of Mustache and Handlebars:
+//
+//   {{name}}               a value, with HTML's special characters escaped
+//   {{{html}}}, {{& html}} a value as it is
+//   {{user.name}}          a field; `items.0` an item; `items.count` a count
+//   {{#if x}} {{else if y}} {{else}} {{/if}}, {{#unless x}} {{/unless}}
+//   {{#each items}} {{this}} {{@index}} {{else}} none {{/each}}
+//   {{#each items as |item i|}} {{item.name}} {{/each}}
+//   {{#with user}} {{name}} {{/with}}
+//   {{> header}}, {{> row item}}   another template, with this or `item`
+//   {{! a comment }}, {{!-- a comment with }} in it --}}
+//
+// A name is looked up in the innermost value first, then outwards, so a
+// page's fields can be used inside `each`. `../name` starts one level
+// out. Unknown names show nothing. A line with only a block tag (or a
+// comment or partial) on it leaves no blank line behind.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// A part of a template.
+enum Node {
+    text(value: String)
+    show(path: String, raw: Bool)
+    // kind: "if", "unless", "each" or "with".
+    block(kind: String, path: String, names: [String], body: [Node], otherwise: [Node])
+    // `indent`: the spaces before a partial alone on its line, put before
+    // each of its lines.
+    include(name: String, path: String, indent: String)
+}
+
+// A tag or a run of text, while reading a template.
+struct Token {
+    // "text", "show", "raw", "open", "else", "close", "comment", "partial"
+    kind: String
+    text: String
+    line: Int
+    // For a partial alone on its line: the spaces before it.
+    indent: String = ""
+}
+
+// A set of templates by name: "page", "users/show".
+public struct Templates {
+    items: [String: [Node]] = [:]
+
+    // The names of the templates, sorted.
+    fn names() -> [String] {
+        items.keys.sorted()
+    }
+}
+
+// Reads every file with the extension in `folder` and its subfolders, and
+// names each by its path below the folder, without the extension:
+// templates/users/show.html is "users/show".
+public fn loadTemplates(_ folder: String, extension: String = "html") -> Result<Templates> {
+    if !isFolder(folder) {
+        return Result.failure(error: Error("can't read the templates: {folder} isn't a folder"))
+    }
+    var texts: [String: String] = [:]
+    collectFiles(folder, "", extension, texts)
+    parseTemplates(texts, source: folder)
+}
+
+fn collectFiles(_ folder: String, _ prefix: String, _ extension: String, _ texts: bind [String: String]) {
+    for name in listFolder(folder) ?? [] {
+        if name.hasPrefix(".") {
+            continue
+        }
+        let path = joinPath(folder, name)
+        if isFolder(path) {
+            collectFiles(path, prefix + name + "/", extension, texts)
+        } else if name.fileExtension == extension {
+            let short = name.substring(from: 0, to: name.count - extension.count - 1)
+            texts[prefix + short] = readFile(path) ?? ""
+        }
+    }
+}
+
+// Templates from texts by name: `["page": "<h1>\{\{title}}</h1>"]`.
+// `source` names where they came from in error messages.
+public fn parseTemplates(_ texts: [String: String], source: String = "") -> Result<Templates> {
+    var set = Templates()
+    for name in texts.keys.sorted() {
+        let where = if source.isEmpty { name } else { joinPath(source, name) }
+        match parseTemplate(texts[name] ?? "", where) {
+            .ok(nodes) -> { set.items[name] = nodes }
+            .failure(e) -> { return Result.failure(error: e) }
+        }
+    }
+    Result.ok(value: set)
+}
+
+// Shows a template with `data`: any value toJson takes (a struct, a
+// dictionary, a list). With `layout`, the page is then shown inside that
+// template, as `{{{body}}}`, with the same data.
+public fn render<T>(_ templates: Templates, _ name: String, _ data: T, layout: String = "") -> String {
+    renderValue(templates, name, toValue(data), layout)
+}
+
+// A rendered template as an HTML answer. A name that isn't in `templates`
+// is a 500, and says so on the error output.
+public fn page<T>(_ templates: Templates, _ name: String, _ data: T, layout: String = "", status: Int = 200) -> Response {
+    for n in [name, layout] {
+        if !n.isEmpty && templates.items[n] == nil {
+            printError("web: there's no template named \"{n}\" (there are {templates.names()})")
+            return text("no template named \"{n}\"", status: 500)
+        }
+    }
+    html(renderValue(templates, name, toValue(data), layout), status: status)
+}
+
+// Shows a template with data given as JSON text (from a file, say). Text
+// that isn't JSON shows the template without data.
+public fn renderJson(_ templates: Templates, _ name: String, _ json: String, layout: String = "") -> String {
+    renderValue(templates, name, parseJson(json) ?? Value.null, layout)
+}
+
+fn renderValue(_ templates: Templates, _ name: String, _ data: Value, _ layout: String) -> String {
+    var out: [String] = []
+    let scopes = [Scope(value: data)]
+    if let nodes = templates.items[name] {
+        renderNodes(nodes, scopes, templates, 0, out)
+    } else {
+        printError("web: there's no template named \"{name}\"")
+    }
+    let body = out.joined(separator: "")
+    if layout.isEmpty {
+        return body
+    }
+    var wrapped: [String] = []
+    if let nodes = templates.items[layout] {
+        renderNodes(nodes, [Scope(value: data, locals: ["body": Value.string(value: body)])], templates, 0, wrapped)
+    } else {
+        printError("web: there's no template named \"{layout}\"")
+    }
+    wrapped.joined(separator: "")
+}
+
+// HTML's special characters as entities, as Handlebars writes them:
+// & < > " ' ` and =.
+public fn escapeHtml(_ text: String) -> String {
+    var plain = true
+    for c in ["&", "<", ">", "\"", "'", "`", "="] {
+        if text.contains(c) {
+            plain = false
+        }
+    }
+    if plain {
+        return text
+    }
+    text.replace("&", with: "&amp;").replace("<", with: "&lt;").replace(">", with: "&gt;")
+        .replace("\"", with: "&quot;").replace("'", with: "&#x27;").replace("`", with: "&#x60;")
+        .replace("=", with: "&#x3D;")
+}
+
+// ---- Reading ----
+
+// A template's parts, or why it can't be read.
+fn parseTemplate(_ text: String, _ name: String) -> Result<[Node]> {
+    var tokens: [Token] = []
+    if let e = tokenize(text, name, tokens) {
+        return Result.failure(error: e)
+    }
+    removeStandalone(tokens)
+    var at = 0
+    var nodes: [Node] = []
+    var ending = ""
+    if let e = parseNodes(tokens, at, name, "", nodes, ending) {
+        return Result.failure(error: e)
+    }
+    Result.ok(value: nodes)
+}
+
+// Cuts a template into text and tags.
+fn tokenize(_ text: String, _ name: String, _ tokens: bind [Token]) -> Error? {
+    let chars = text.characters
+    var i = 0
+    var line = 1
+    var textStart = 0
+    var textLine = 1
+    while i < chars.count {
+        if chars[i] == "\n" {
+            line += 1
+            i += 1
+            continue
+        }
+        if chars[i] != "\{" || i + 1 >= chars.count || chars[i + 1] != "\{" {
+            i += 1
+            continue
+        }
+        // A tag starts at i.
+        if i > textStart {
+            tokens.append(Token(kind: "text", text: slice(chars, textStart, i), line: textLine))
+        }
+        let tagLine = line
+        let triple = i + 2 < chars.count && chars[i + 2] == "\{"
+        let open = if triple { 3 } else { 2 }
+        var close = if triple { "}}}" } else { "}}" }
+        let longComment = !triple && slice(chars, i + 2, i + 5) == "!--"
+        if longComment {
+            close = "--}}"
+        }
+        let end = findText(chars, close, i + open)
+        if end < 0 {
+            return Error("{name} line {tagLine}: this tag isn't closed with {close}")
+        }
+        let inner = slice(chars, i + open, end).trim()
+        for c in slice(chars, i, end).characters {
+            if c == "\n" {
+                line += 1
+            }
+        }
+        i = end + close.count
+        textStart = i
+        textLine = line
+        if triple {
+            tokens.append(Token(kind: "raw", text: inner, line: tagLine))
+        } else if inner.hasPrefix("!") {
+            tokens.append(Token(kind: "comment", text: "", line: tagLine))
+        } else if inner.hasPrefix("#") {
+            tokens.append(Token(kind: "open", text: inner.substring(from: 1, to: inner.count).trim(), line: tagLine))
+        } else if inner.hasPrefix("/") {
+            tokens.append(Token(kind: "close", text: inner.substring(from: 1, to: inner.count).trim(), line: tagLine))
+        } else if inner.hasPrefix(">") {
+            tokens.append(Token(kind: "partial", text: inner.substring(from: 1, to: inner.count).trim(), line: tagLine))
+        } else if inner.hasPrefix("&") {
+            tokens.append(Token(kind: "raw", text: inner.substring(from: 1, to: inner.count).trim(), line: tagLine))
+        } else if inner == "else" || inner.hasPrefix("else ") {
+            tokens.append(Token(kind: "else", text: inner.substring(from: 4, to: inner.count).trim(), line: tagLine))
+        } else {
+            if inner.isEmpty {
+                return Error("{name} line {tagLine}: an empty tag")
+            }
+            tokens.append(Token(kind: "show", text: inner, line: tagLine))
+        }
+    }
+    if chars.count > textStart {
+        tokens.append(Token(kind: "text", text: slice(chars, textStart, chars.count), line: textLine))
+    }
+    nil
+}
+
+fn slice(_ chars: [String], _ from: Int, _ to: Int) -> String {
+    var parts: [String] = []
+    var i = max(from, 0)
+    let end = min(to, chars.count)
+    while i < end {
+        parts.append(chars[i])
+        i += 1
+    }
+    parts.joined(separator: "")
+}
+
+// Where `word` first appears in `chars` at or after `from`, or -1.
+fn findText(_ chars: [String], _ word: String, _ from: Int) -> Int {
+    let w = word.characters
+    var i = from
+    while i + w.count <= chars.count {
+        var k = 0
+        while k < w.count && chars[i + k] == w[k] {
+            k += 1
+        }
+        if k == w.count {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// Takes away the line around a block, else, comment or partial tag that's
+// alone on its line: the spaces before it and the line break after it.
+// Every tag is judged on the template as written, then the text is cut.
+fn removeStandalone(_ tokens: bind [Token]) {
+    let n = tokens.count
+    var alone: [Bool] = []
+    for i in 0..n {
+        alone.append(isStandalone(tokens, i))
+    }
+    for i in 0..n {
+        if tokens[i].kind != "text" {
+            continue
+        }
+        let t = tokens[i].text
+        // After a lone tag, drop the rest of its line; before one, the
+        // spaces on its line.
+        var start = 0
+        var end = t.count
+        if i > 0 && alone[i - 1] {
+            start = if let nl = t.find("\n") { nl + 1 } else { t.count }
+        }
+        if i + 1 < n && alone[i + 1] {
+            end = (t.findLast("\n") ?? -1) + 1
+            if kindOf(tokens, i + 1) == "partial" {
+                tokens[i + 1].indent = t.substring(from: end, to: t.count)
+            }
+        }
+        tokens[i].text = if end > start { t.substring(from: start, to: end) } else { "" }
+    }
+}
+
+fn kindOf(_ tokens: [Token], _ i: Int) -> String {
+    tokens[i].kind
+}
+
+// Whether tokens[i] is a block, else, comment or partial tag with only
+// spaces before and after it on its line.
+fn isStandalone(_ tokens: [Token], _ i: Int) -> Bool {
+    let kind = tokens[i].kind
+    if kind != "open" && kind != "else" && kind != "close" && kind != "comment" && kind != "partial" {
+        return false
+    }
+    var before = i == 0
+    if i > 0 && tokens[i - 1].kind == "text" {
+        let t = tokens[i - 1].text
+        let cut = (t.findLast("\n") ?? -1) + 1
+        before = t.substring(from: cut, to: t.count).trim().isEmpty && (cut > 0 || i == 1)
+    }
+    var after = i == tokens.count - 1
+    if i + 1 < tokens.count && tokens[i + 1].kind == "text" {
+        let t = tokens[i + 1].text
+        if let nl = t.find("\n") {
+            after = t.substring(from: 0, to: nl).trim().isEmpty
+        } else {
+            after = t.trim().isEmpty && i + 1 == tokens.count - 1
+        }
+    }
+    before && after
+}
+
+// Reads nodes from tokens[at] until a close or else tag (which ends the
+// block being read, `open`), and leaves `at` on that tag.
+fn parseNodes(_ tokens: [Token], _ at: bind Int, _ name: String, _ open: String,
+              _ nodes: bind [Node], _ ending: bind String) -> Error? {
+    while at < tokens.count {
+        let t = tokens[at]
+        match t.kind {
+            "text" -> {
+                if !t.text.isEmpty {
+                    nodes.append(Node.text(value: t.text))
+                }
+                at += 1
+            }
+            "comment" -> { at += 1 }
+            "show" -> {
+                nodes.append(Node.show(path: t.text, raw: false))
+                at += 1
+            }
+            "raw" -> {
+                nodes.append(Node.show(path: t.text, raw: true))
+                at += 1
+            }
+            "partial" -> {
+                let words = t.text.words()
+                if words.isEmpty {
+                    return Error("{name} line {t.line}: \{\{>}} needs a template's name")
+                }
+                let path = if words.count > 1 { words[1] } else { "this" }
+                nodes.append(Node.include(name: words[0].replace("\"", with: ""), path: path, indent: t.indent))
+                at += 1
+            }
+            "else", "close" -> {
+                if open.isEmpty {
+                    let shown = if t.kind == "else" { "\{\{else}}" } else { "\{\{/{t.text}}}" }
+                    return Error("{name} line {t.line}: {shown} has no block to end")
+                }
+                ending = t.kind
+                return nil
+            }
+            "open" -> {
+                if let e = parseBlock(tokens, at, name, t.text, t.line, nodes) {
+                    return e
+                }
+            }
+            _ -> { at += 1 }
+        }
+    }
+    if !open.isEmpty {
+        return Error("{name}: \{\{#{open}}} isn't closed with \{\{/{open}}}")
+    }
+    nil
+}
+
+// Reads a block from its opening tag (`head` is what follows the #) to
+// its closing one.
+fn parseBlock(_ tokens: [Token], _ at: bind Int, _ name: String, _ head: String, _ line: Int,
+              _ nodes: bind [Node]) -> Error? {
+    let words = head.words()
+    let kind = if words.isEmpty { "" } else { words[0] }
+    if kind != "if" && kind != "unless" && kind != "each" && kind != "with" {
+        return Error("{name} line {line}: \{\{#{kind}}} isn't a block (there are if, unless, each and with)")
+    }
+    if words.count < 2 {
+        return Error("{name} line {line}: \{\{#{kind}}} needs a value: \{\{#{kind} items}}")
+    }
+    let path = words[1]
+    var names: [String] = []
+    if words.count > 2 {
+        // `as |item index|`
+        let rest = words.slice(from: 2, to: words.count).joined(separator: " ")
+        if kind != "each" && kind != "with" || !rest.hasPrefix("as |") || !rest.hasSuffix("|") {
+            return Error("{name} line {line}: can't read \{\{#{head}}}")
+        }
+        names = rest.substring(from: 4, to: rest.count - 1).words()
+        if names.isEmpty || names.count > 2 {
+            return Error("{name} line {line}: give one or two names between the bars: as |item index|")
+        }
+    }
+    at += 1
+    var body: [Node] = []
+    var ending = ""
+    if let e = parseNodes(tokens, at, name, kind, body, ending) {
+        return e
+    }
+    var otherwise: [Node] = []
+    if ending == "else" {
+        let elseTag = tokens[at]
+        if !elseTag.text.isEmpty {
+            // `else if x`: the rest is a block of its own, closed by this
+            // block's closing tag.
+            let inner = elseTag.text.words()
+            if kind != "if" && kind != "unless" || inner.count != 2 || (inner[0] != "if" && inner[0] != "unless") {
+                return Error("{name} line {elseTag.line}: can't read \{\{else {elseTag.text}}}")
+            }
+            var nested: [Node] = []
+            if let e = parseElseIf(tokens, at, name, inner[0], inner[1], kind, nested) {
+                return e
+            }
+            otherwise = nested
+            nodes.append(Node.block(kind: kind, path: path, names: names, body: body, otherwise: otherwise))
+            return nil
+        }
+        at += 1
+        if let e = parseNodes(tokens, at, name, kind, otherwise, ending) {
+            return e
+        }
+        if ending == "else" {
+            return Error("{name} line {tokens[at].line}: a second \{\{else}} in \{\{#{kind}}}")
+        }
+    }
+    // `at` is on the closing tag.
+    let closing = tokens[at]
+    if closing.text != kind {
+        return Error("{name} line {closing.line}: \{\{/{closing.text}}} closes \{\{#{kind}}} from line {line}")
+    }
+    at += 1
+    nodes.append(Node.block(kind: kind, path: path, names: names, body: body, otherwise: otherwise))
+    nil
+}
+
+// Reads `{{else if x}}…` up to the outer block's closing tag, as a block of
+// its own.
+fn parseElseIf(_ tokens: [Token], _ at: bind Int, _ name: String, _ kind: String, _ path: String,
+               _ outer: String, _ nodes: bind [Node]) -> Error? {
+    at += 1
+    var body: [Node] = []
+    var ending = ""
+    if let e = parseNodes(tokens, at, name, outer, body, ending) {
+        return e
+    }
+    var otherwise: [Node] = []
+    if ending == "else" {
+        let elseTag = tokens[at]
+        if !elseTag.text.isEmpty {
+            let inner = elseTag.text.words()
+            if inner.count != 2 || (inner[0] != "if" && inner[0] != "unless") {
+                return Error("{name} line {elseTag.line}: can't read \{\{else {elseTag.text}}}")
+            }
+            if let e = parseElseIf(tokens, at, name, inner[0], inner[1], outer, otherwise) {
+                return e
+            }
+            nodes.append(Node.block(kind: kind, path: path, names: [], body: body, otherwise: otherwise))
+            return nil
+        }
+        at += 1
+        if let e = parseNodes(tokens, at, name, outer, otherwise, ending) {
+            return e
+        }
+        if ending == "else" {
+            return Error("{name} line {tokens[at].line}: a second \{\{else}} in \{\{#{outer}}}")
+        }
+    }
+    let closing = tokens[at]
+    if closing.text != outer {
+        return Error("{name} line {closing.line}: \{\{/{closing.text}}} closes \{\{#{outer}}}")
+    }
+    at += 1
+    nodes.append(Node.block(kind: kind, path: path, names: [], body: body, otherwise: otherwise))
+    nil
+}
+
+// ---- Showing ----
+
+// A level of values names are looked up in: a value, and names of its own
+// (@index, @key, @first, @last, and `as |…|` names).
+struct Scope {
+    value: Value
+    locals: [String: Value] = [:]
+}
+
+fn renderNodes(_ nodes: [Node], _ scopes: [Scope], _ templates: Templates, _ depth: Int, _ out: bind [String]) {
+    for node in nodes {
+        match node {
+            .text(t) -> out.append(t)
+            .show(path, raw) -> {
+                let shown = display(lookup(scopes, path))
+                out.append(if raw { shown } else { escapeHtml(shown) })
+            }
+            .include(name, path, indent) -> {
+                if depth > 50 {
+                    out.append("[templates include each other too deeply at {name}]")
+                } else if let inner = templates.items[name] {
+                    let value = lookup(scopes, path)
+                    var nested = scopes
+                    nested.append(Scope(value: value))
+                    if indent.isEmpty {
+                        renderNodes(inner, nested, templates, depth + 1, out)
+                    } else {
+                        var part: [String] = []
+                        renderNodes(inner, nested, templates, depth + 1, part)
+                        out.append(indented(part.joined(separator: ""), indent))
+                    }
+                } else {
+                    printError("web: there's no template named \"{name}\" to include")
+                }
+            }
+            .block(kind, path, names, body, otherwise) -> renderBlock(kind, path, names, body, otherwise, scopes, templates, depth, out)
+        }
+    }
+}
+
+fn renderBlock(_ kind: String, _ path: String, _ names: [String], _ body: [Node], _ otherwise: [Node],
+               _ scopes: [Scope], _ templates: Templates, _ depth: Int, _ out: bind [String]) {
+    let value = lookup(scopes, path)
+    if kind == "if" || kind == "unless" {
+        let yes = truthy(value) == (kind == "if")
+        renderNodes(if yes { body } else { otherwise }, scopes, templates, depth, out)
+        return
+    }
+    if kind == "with" {
+        if !truthy(value) {
+            renderNodes(otherwise, scopes, templates, depth, out)
+            return
+        }
+        var nested = scopes
+        if names.isEmpty {
+            nested.append(Scope(value: value))
+        } else {
+            nested.append(Scope(value: value, locals: [names[0]: value]))
+        }
+        renderNodes(body, nested, templates, depth, out)
+        return
+    }
+    // each
+    var items: [Value] = []
+    var keys: [String] = []
+    match value {
+        .list(list) -> { items = list }
+        .object(k, v) -> {
+            items = v
+            keys = k
+        }
+        _ -> {}
+    }
+    if items.isEmpty {
+        renderNodes(otherwise, scopes, templates, depth, out)
+        return
+    }
+    for i in 0..items.count {
+        var locals: [String: Value] = [
+            "@index": Value.number(text: "{i}"),
+            "@first": Value.bool(value: i == 0),
+            "@last": Value.bool(value: i == items.count - 1),
+        ]
+        locals["@key"] = if keys.isEmpty { Value.number(text: "{i}") } else { Value.string(value: keys[i]) }
+        var scope = Scope(value: items[i], locals: locals)
+        if !names.isEmpty {
+            scope.locals[names[0]] = items[i]
+            if names.count > 1 {
+                scope.locals[names[1]] = if keys.isEmpty { Value.number(text: "{i}") } else { Value.string(value: keys[i]) }
+            }
+        }
+        var nested = scopes
+        nested.append(scope)
+        renderNodes(body, nested, templates, depth, out)
+    }
+}
+
+// `text` with `indent` before each line (not after a last line break).
+fn indented(_ text: String, _ indent: String) -> String {
+    if text.isEmpty {
+        return text
+    }
+    let ends = text.hasSuffix("\n")
+    let body = if ends { text.substring(from: 0, to: text.count - 1) } else { text }
+    let lines = body.split("\n").map { l in indent + l }
+    lines.joined(separator: "\n") + (if ends { "\n" } else { "" })
+}
+
+// The value a path names, looking in the innermost scope first.
+fn lookup(_ scopes: [Scope], _ path: String) -> Value {
+    var p = path
+    var top = scopes.count - 1
+    while p.hasPrefix("../") {
+        p = p.substring(from: 3, to: p.count)
+        top -= 1
+    }
+    if top < 0 {
+        return Value.null
+    }
+    if p == "this" || p == "." {
+        return scopes[top].value
+    }
+    if p.hasPrefix("this.") {
+        p = p.substring(from: 5, to: p.count)
+        return follow(scopes[top].value, p.split("."))
+    }
+    let parts = p.split(".")
+    let first = parts[0]
+    var level = top
+    while level >= 0 {
+        let scope = scopes[level]
+        if let local = scope.locals[first] {
+            return follow(local, parts.slice(from: 1, to: parts.count))
+        }
+        if let found = field(scope.value, first) {
+            return follow(found, parts.slice(from: 1, to: parts.count))
+        }
+        level -= 1
+    }
+    Value.null
+}
+
+fn follow(_ value: Value, _ parts: [String]) -> Value {
+    var v = value
+    for part in parts {
+        if let next = field(v, part) {
+            v = next
+        } else {
+            return Value.null
+        }
+    }
+    v
+}
+
+// A field of an object, an item of a list by number, or a list's count.
+fn field(_ value: Value, _ name: String) -> Value? {
+    match value {
+        .object(keys, values) -> {
+            for i in 0..keys.count {
+                if keys[i] == name {
+                    return values[i]
+                }
+            }
+            nil
+        }
+        .list(items) -> {
+            if name == "count" || name == "length" {
+                return Value.number(text: "{items.count}")
+            }
+            if let i = Int(name) {
+                if i >= 0 && i < items.count {
+                    return items[i]
+                }
+            }
+            nil
+        }
+        .string(s) -> {
+            if name == "count" || name == "length" {
+                return Value.number(text: "{s.count}")
+            }
+            nil
+        }
+        _ -> nil
+    }
+}
+
+// Whether a value counts as true in #if: not nil, false, 0, "" or an
+// empty list.
+fn truthy(_ value: Value) -> Bool {
+    match value {
+        .null -> false
+        .bool(b) -> b
+        .number(t) -> (Float(t) ?? 0) != 0
+        .string(s) -> !s.isEmpty
+        .list(items) -> !items.isEmpty
+        .object(_, _) -> true
+    }
+}
+
+// A value as text: nil shows nothing.
+fn display(_ value: Value) -> String {
+    match value {
+        .null -> ""
+        .bool(b) -> if b { "true" } else { "false" }
+        .number(t) -> t
+        .string(s) -> s
+        _ -> jsonText(value)
+    }
+}

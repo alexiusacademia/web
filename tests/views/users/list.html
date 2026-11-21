@@ -1,0 +1,8 @@
+<h1>{{title}}</h1>
+<ul>
+  {{#each users}}
+  {{> users/row}}
+  {{else}}
+  <li>No users yet</li>
+  {{/each}}
+</ul>

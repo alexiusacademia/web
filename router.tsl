@@ -1,0 +1,379 @@
+// web: routes and middleware. A Router holds routes (a method, a path
+// pattern and a handler) and middleware; `handle` runs a request through
+// them, and `serve` puts a Router on the network.
+//
+// Patterns are paths whose parts can be `:name` (one part, any text) or,
+// as the last part, `*name` (the rest of the path, slashes and all). When
+// several routes fit a path, the one with fixed text earliest wins:
+// `/users/new` before `/users/:id`, and `:id` before `*rest`.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// What a middleware's `before` does with a request: pass it on (changed or
+// not) or answer it itself.
+public enum Step {
+    next(request: Request)
+    stop(response: Response)
+}
+
+// Code that runs around handlers: `before` sees each request first, and
+// `after` sees each answer before it's sent, in the opposite order.
+public struct Middleware {
+    before: fn(Request) -> Step = passOn
+    after: fn(Request, Response) -> Response = keep
+}
+
+// Middleware that only looks at requests: return `.next(request:)` to go
+// on, or `.stop(response:)` to answer.
+public fn onRequest(_ f: fn(Request) -> Step) -> Middleware {
+    Middleware(before: f)
+}
+
+// Middleware that only changes answers.
+public fn onResponse(_ f: fn(Request, Response) -> Response) -> Middleware {
+    Middleware(after: f)
+}
+
+// Passes a request on: `return web.next(request)` in a `before`.
+public fn next(_ request: Request) -> Step {
+    Step.next(request: request)
+}
+
+// Answers in a `before`, instead of passing the request on.
+public fn stop(_ response: Response) -> Step {
+    Step.stop(response: response)
+}
+
+fn passOn(_ request: Request) -> Step {
+    Step.next(request: request)
+}
+
+fn keep(_ request: Request, _ response: Response) -> Response {
+    response
+}
+
+// One part of a pattern.
+struct Segment {
+    // 0: fixed text, 1: `:name`, 2: `*name`.
+    kind: Int
+    text: String
+}
+
+// A route: requests with this method whose path fits the pattern go to
+// the handler. Answers come from `answer` at once, or from `later`.
+struct Route {
+    method: String
+    pattern: String
+    segments: [Segment]
+    answer: fn(Request) -> Response
+    later: fn(Request, fn(Response))? = nil
+    // The middleware of the routers it was mounted from, outermost first.
+    middleware: [Middleware] = []
+}
+
+// Routes and middleware: what a server does with each request.
+public struct Router {
+    routes: [Route] = []
+    middleware: [Middleware] = []
+    missing: fn(Request) -> Response = defaultNotFound
+
+    // Answers GET requests whose path fits `pattern` (and HEAD ones).
+    fn get(_ pattern: String, _ handler: fn(Request) -> Response) {
+        add("GET", pattern, handler)
+    }
+
+    fn post(_ pattern: String, _ handler: fn(Request) -> Response) {
+        add("POST", pattern, handler)
+    }
+
+    fn put(_ pattern: String, _ handler: fn(Request) -> Response) {
+        add("PUT", pattern, handler)
+    }
+
+    fn patch(_ pattern: String, _ handler: fn(Request) -> Response) {
+        add("PATCH", pattern, handler)
+    }
+
+    fn delete(_ pattern: String, _ handler: fn(Request) -> Response) {
+        add("DELETE", pattern, handler)
+    }
+
+    // Answers requests of any method whose path fits `pattern`.
+    fn any(_ pattern: String, _ handler: fn(Request) -> Response) {
+        add("*", pattern, handler)
+    }
+
+    // Answers requests of `method` ("GET", "POST", …, or "*" for any).
+    fn add(_ method: String, _ pattern: String, _ handler: fn(Request) -> Response) {
+        routes.append(Route(method: method.uppercase(), pattern: pattern, segments: parsePattern(pattern), answer: handler))
+    }
+
+    // A route whose handler answers later: it calls `reply` when the
+    // answer is ready, after its own request to another server, a timer
+    // or `background` work.
+    fn later(_ method: String, _ pattern: String, _ handler: fn(Request, fn(Response))) {
+        routes.append(Route(method: method.uppercase(), pattern: pattern, segments: parsePattern(pattern),
+                            answer: defaultNotFound, later: handler))
+    }
+
+    // Serves the files of `folder` under `prefix`: with
+    // `router.files("/static", folder: "public")`, /static/css/site.css
+    // sends public/css/site.css.
+    fn files(_ prefix: String, folder: String, options: FileOptions = FileOptions()) {
+        let base = trimSlashes(prefix)
+        let pattern = if base.isEmpty { "/*file" } else { "/" + base + "/*file" }
+        routes.append(Route(method: "GET", pattern: pattern, segments: parsePattern(pattern),
+                            answer: { r in folderFile(folder, r, restOf(r), options) }))
+    }
+
+    // Adds middleware for every request, routes or not, in the order added.
+    fn use(_ m: Middleware) {
+        middleware.append(m)
+    }
+
+    // Adds another router's routes under `prefix` ("/api"): its routes'
+    // paths are the prefix followed by theirs, and its middleware runs
+    // only for its routes, after this router's.
+    fn mount(_ prefix: String, _ other: Router) {
+        let base = trimSlashes(prefix)
+        for route in other.routes {
+            var r = route
+            let rest = trimSlashes(route.pattern)
+            r.pattern = if rest.isEmpty { "/" + base } else if base.isEmpty { "/" + rest } else { "/" + base + "/" + rest }
+            r.segments = parsePattern(r.pattern)
+            r.middleware = other.middleware + route.middleware
+            routes.append(r)
+        }
+    }
+
+    // What answers requests no route fits (a 404 by default).
+    fn notFound(_ handler: fn(Request) -> Response) {
+        missing = handler
+    }
+
+    // Runs a request through the middleware and routes, and calls `reply`
+    // with the answer: at once, or later for a `later` route.
+    fn handle(_ request: Request, _ reply: fn(Response)) {
+        var req = request
+        req.method = req.method.uppercase()
+        if req.received == 0 {
+            req.received = now()
+        }
+        runChain(middleware, 0, req, { r, done in dispatch(self, r, done) }, reply)
+    }
+}
+
+// Finds the route for a request and answers it, after the route's own
+// middleware.
+fn dispatch(_ router: Router, _ request: Request, _ reply: fn(Response)) {
+    let parts = splitPath(request.path)
+    var best = -1
+    var bestScore: [Int] = []
+    var bestParams: [String: String] = [:]
+    var bestRest: [String] = []
+    var allowed: [String] = []
+    var i = 0
+    for route in router.routes {
+        if let (params, rest) = matchSegments(route.segments, parts) {
+            let fits = route.method == "*" || route.method == request.method ||
+                (request.method == "HEAD" && route.method == "GET")
+            if !fits {
+                if !allowed.contains(route.method) {
+                    allowed.append(route.method)
+                }
+            } else {
+                let score = route.segments.map { s in s.kind }
+                if best < 0 || better(score, bestScore) {
+                    best = i
+                    bestScore = score
+                    bestParams = params
+                    bestRest = rest
+                }
+            }
+        }
+        i += 1
+    }
+    if best < 0 {
+        if allowed.isEmpty {
+            reply(router.missing(request))
+            return
+        }
+        if allowed.contains("GET") && !allowed.contains("HEAD") {
+            allowed.append("HEAD")
+        }
+        allowed.append("OPTIONS")
+        let allow = allowed.sorted().joined(separator: ", ")
+        if request.method == "OPTIONS" {
+            reply(Response(status: 204, headers: ["Allow": allow]))
+        } else {
+            reply(status(405).withHeader("Allow", allow))
+        }
+        return
+    }
+    let route = router.routes[best]
+    var req = withRest(request, bestRest)
+    req.params = bestParams
+    runChain(route.middleware, 0, req, { r, done in
+        if let later = route.later {
+            later(r, done)
+        } else {
+            done(route.answer(r))
+        }
+    }, reply)
+}
+
+// Runs `chain` from index `at`: each `before` in turn, then `last`, then
+// the `after`s back out, and `reply` with the answer.
+fn runChain(_ chain: [Middleware], _ at: Int, _ request: Request,
+        _ last: fn(Request, fn(Response)), _ reply: fn(Response)) {
+if at >= chain.count {
+    last(request, reply)
+    return
+}
+let m = chain[at]
+match m.before(request) {
+    .stop(response) -> reply(m.after(request, response))
+    .next(passed) -> runChain(chain, at + 1, passed, last, { response in
+        reply(m.after(passed, response))
+    })
+}
+}
+
+// Whether a route with these segment kinds beats one with `other`: the
+// first difference decides, fixed text before `:name` before `*name`;
+// then the longer pattern.
+fn better(_ score: [Int], _ other: [Int]) -> Bool {
+    var i = 0
+    while i < score.count && i < other.count {
+        if score[i] != other[i] {
+            return score[i] < other[i]
+        }
+        i += 1
+    }
+    score.count > other.count
+}
+
+// A pattern's parts.
+fn parsePattern(_ pattern: String) -> [Segment] {
+    var out: [Segment] = []
+    for part in splitPath(pattern) {
+        if part.hasPrefix(":") {
+            out.append(Segment(kind: 1, text: part.substring(from: 1, to: part.count)))
+        } else if part.hasPrefix("*") {
+            out.append(Segment(kind: 2, text: part.substring(from: 1, to: part.count)))
+        } else {
+            out.append(Segment(kind: 0, text: part))
+        }
+    }
+    out
+}
+
+// The parts of a path between slashes, leaving out empty ones, so
+// "/users/" and "/users" are the same.
+fn splitPath(_ path: String) -> [String] {
+    path.split("/").filter { p in !p.isEmpty }
+}
+
+fn trimSlashes(_ text: String) -> String {
+    splitPath(text).joined(separator: "/")
+}
+
+// The values a pattern takes from a path's (still encoded) parts, or nil
+// if it doesn't fit.
+fn matchSegments(_ segments: [Segment], _ parts: [String]) -> ([String: String], [String])? {
+    var params: [String: String] = [:]
+    var i = 0
+    for s in segments {
+        if s.kind == 2 {
+            var rest: [String] = []
+            var k = i
+            while k < parts.count {
+                rest.append(pathDecoded(parts[k]))
+                k += 1
+            }
+            params[s.text] = rest.joined(separator: "/")
+            var raw: [String] = []
+            k = i
+            while k < parts.count {
+                raw.append(parts[k])
+                k += 1
+            }
+            return (params, raw)
+        }
+        if i >= parts.count {
+            return nil
+        }
+        if s.kind == 0 {
+            if s.text != parts[i] && s.text != pathDecoded(parts[i]) {
+                return nil
+            }
+        } else {
+            params[s.text] = pathDecoded(parts[i])
+        }
+        i += 1
+    }
+    if i != parts.count {
+        return nil
+    }
+    let none: [String] = []
+    (params, none)
+}
+
+// The default answer when no route fits.
+fn defaultNotFound(_ request: Request) -> Response {
+    status(404)
+}
+
+// Serves a router on `port` (0 takes a free one; `tcpPort` says which),
+// and returns the server's id for `tcpPort` and `stopHTTP`, or -1 if it
+// can't listen. `host: "0.0.0.0"` lets other computers reach it.
+public fn serve(_ router: Router, port: Int, host: String = "127.0.0.1") -> Int {
+    serveHTTP(port: port, host: host) { r in
+        let request = Request(id: r.id, method: r.method, path: r.path, query: r.query,
+                              headers: r.headers, body: r.body, remote: r.remote, received: now())
+        let keepAlive = (request.header("connection") ?? "").lowercase().contains("keep-alive")
+        router.handle(request) { response in
+            var headers = wireHeaders(response)
+            // Tessel's server keeps an HTTP/1.0 client's connection open
+            // when it asks to, but doesn't say so; such clients wait for
+            // the connection to close unless the answer says it stays.
+            if keepAlive && response.header("connection") == nil {
+                headers["Connection"] = "keep-alive"
+            }
+            respondHTTP(r.id, status: response.status, headers: headers, body: response.body)
+        }
+    }
+}
+
+// Runs a request made up in a test through a router, and gives the
+// answer, or nil if it's answered later (use `handle` for those).
+public fn call(_ router: Router, _ method: String, _ path: String, body: String = "",
+               headers: [String: String] = [:]) -> Response? {
+    var target = path
+    var query = ""
+    if let q = path.find("?") {
+        target = path.substring(from: 0, to: q)
+        query = path.substring(from: q + 1, to: path.count)
+    }
+    var lower: [String: String] = [:]
+    for (k, v) in headers {
+        lower[k.lowercase()] = v
+    }
+    let request = Request(method: method, path: target, query: query, headers: lower,
+                          body: Data(text: body), remote: "127.0.0.1:0")
+    var answer: Response? = nil
+    router.handle(request) { response in
+        answer = response
+    }
+    answer
+}
+
+// A percent-encoded part of a path, decoded. Unlike a query, a `+` in a
+// path is a plus. A broken `%` code leaves the part as it is.
+fn pathDecoded(_ part: String) -> String {
+    if !part.contains("%") && !part.contains("+") {
+        return part
+    }
+    part.replace("+", with: "%2B").urlDecoded ?? part
+}

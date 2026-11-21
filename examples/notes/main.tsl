@@ -1,0 +1,88 @@
+// An example of web: a small notes site. Pages from templates with a
+// layout, a form that adds notes, a JSON API, a stylesheet from a folder,
+// and signing in with a session. Notes are kept in memory.
+//
+// Run it from the library's folder: `tessel run examples/notes`, then
+// open http://127.0.0.1:8080/ (the password is "tessel").
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+import "../.."
+
+struct Note {
+    id: Int
+    text: String
+    author: String
+}
+
+struct HomePage {
+    title: String
+    user: String
+    notes: [Note]
+    error: String = ""
+}
+
+fn main() {
+    let pages = try web.loadTemplates(joinPath(appFolder(), "views"))
+    var notes = [Note(id: 1, text: "Try adding a note", author: "web")]
+    var nextId = 2
+
+    var router = web.Router()
+    router.use(web.logger())
+    router.use(web.securityHeaders())
+    router.use(web.sessions(secret: environment("NOTES_SECRET") ?? "change me: a long random text"))
+    router.files("/static", folder: joinPath(appFolder(), "public"))
+
+    router.get("/") { r in
+        let user = r.session["user"] ?? ""
+        web.page(pages, "home", HomePage(title: "Notes", user: user, notes: notes.reversed(),
+                                        error: r.queryValue("error") ?? ""), layout: "layout")
+    }
+    router.post("/notes") { r in
+        let user = r.session["user"] ?? ""
+        let text = (r.form()["text"] ?? "").trim()
+        if user.isEmpty {
+            return web.redirect("/?error=Sign+in+first", status: 303)
+        }
+        if text.isEmpty {
+            return web.redirect("/?error=Write+something", status: 303)
+        }
+        notes.append(Note(id: nextId, text: text, author: user))
+        nextId += 1
+        web.redirect("/", status: 303)
+    }
+    router.post("/login") { r in
+        let form = r.form()
+        let name = (form["name"] ?? "").trim()
+        if name.isEmpty || form["password"] != "tessel" {
+            return web.redirect("/?error=Wrong+password", status: 303)
+        }
+        web.redirect("/", status: 303).withSession(["user": name])
+    }
+    router.post("/logout") { r in
+        web.redirect("/", status: 303).withSession([:])
+    }
+
+    // The same notes as JSON, for programs.
+    var api = web.Router()
+    api.use(web.cors())
+    api.get("/notes") { r in web.json(notes) }
+    api.get("/notes/:id") { r in
+        for note in notes {
+            if "{note.id}" == r.param("id") {
+                return web.json(note)
+            }
+        }
+        web.json(["error": "no note {r.param("id")}"], status: 404)
+    }
+    router.mount("/api", api)
+
+    let port = Int(environment("PORT") ?? "") ?? 8080
+    let server = web.serve(router, port: port)
+    if server == -1 {
+        print("can't serve: port {port} is taken")
+        return
+    }
+    print("Notes at http://127.0.0.1:{tcpPort(server)}/")
+}

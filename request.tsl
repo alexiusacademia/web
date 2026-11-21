@@ -1,0 +1,327 @@
+// web: the request a handler gets. It's what `serveHTTP` hands over, plus
+// the values taken from the path (`params`) and notes that middleware
+// leaves for the handler (`values`), with ways to read the query, forms,
+// uploads, cookies and JSON.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// A request to the server.
+public struct Request {
+    // The server's id for the request; 0 for one made in a test.
+    id: Int = 0
+    // "GET", "POST", …, in capitals.
+    method: String = "GET"
+    // The path as sent, without the query: "/users/ann%20lee".
+    path: String = "/"
+    // What followed `?`, as sent: "page=2&sort=name".
+    query: String = ""
+    // The headers, with names in lowercase.
+    headers: [String: String] = [:]
+    body: Data = Data()
+    // The client's "ip:port".
+    remote: String = ""
+    // The parts of the path a route named, decoded: `/users/:id` gives "id".
+    params: [String: String] = [:]
+    // Notes left by middleware for the handler, like the signed-in user.
+    values: [String: String] = [:]
+    // The session's values, when the `sessions` middleware is used.
+    session: [String: String] = [:]
+    // When the request arrived (see `now()`).
+    received: Float = 0
+    // The path's parts a `*name` took, still encoded.
+    private rest: [String] = []
+
+    // A header's value, by its name in any case.
+    fn header(_ name: String) -> String? {
+        headers[name.lowercase()]
+    }
+
+    // A value the route took from the path, or "" if it has none.
+    fn param(_ name: String) -> String {
+        params[name] ?? ""
+    }
+
+    // The first value of `name` in the query, decoded.
+    fn queryValue(_ name: String) -> String? {
+        let all = queryValues(name)
+        if all.isEmpty {
+            return nil
+        }
+        all[0]
+    }
+
+    // Every value of `name` in the query, in order: `tag=a&tag=b`.
+    fn queryValues(_ name: String) -> [String] {
+        var out: [String] = []
+        for (key, value) in formPairs(query) {
+            if key == name {
+                out.append(value)
+            }
+        }
+        out
+    }
+
+    // The whole query as a dictionary (the last value of a repeated name).
+    fn queryDict() -> [String: String] {
+        var out: [String: String] = [:]
+        for (key, value) in formPairs(query) {
+            out[key] = value
+        }
+        out
+    }
+
+    // The body as text, or "" if it isn't UTF-8.
+    fn text() -> String {
+        body.text ?? ""
+    }
+
+    // The content type without its parameters, in lowercase: "text/html".
+    fn contentType() -> String {
+        let full = header("content-type") ?? ""
+        let cut = full.find(";") ?? full.count
+        full.substring(from: 0, to: cut).trim().lowercase()
+    }
+
+    // A form's fields: from a urlencoded body, or the fields (not the
+    // files) of a multipart one. Empty for any other body.
+    fn form() -> [String: String] {
+        var out: [String: String] = [:]
+        let type = contentType()
+        if type == "application/x-www-form-urlencoded" {
+            for (key, value) in formPairs(text()) {
+                out[key] = value
+            }
+        } else if type == "multipart/form-data" {
+            for part in parts() {
+                if part.fileName == nil {
+                    out[part.name] = part.data.text ?? ""
+                }
+            }
+        }
+        out
+    }
+
+    // The parts of a multipart/form-data body: fields and uploaded files.
+    fn parts() -> [Part] {
+        if contentType() != "multipart/form-data" {
+            return []
+        }
+        let boundary = headerParameter(header("content-type") ?? "", "boundary")
+        if boundary.isEmpty {
+            return []
+        }
+        multipartParts(body, boundary)
+    }
+
+    // The uploaded file sent as field `name`, if there is one.
+    fn file(_ name: String) -> Part? {
+        for part in parts() {
+            if part.name == name && part.fileName != nil {
+                return part
+            }
+        }
+        nil
+    }
+
+    // The cookies the client sent.
+    fn cookies() -> [String: String] {
+        var out: [String: String] = [:]
+        for piece in (header("cookie") ?? "").split(";") {
+            if let eq = piece.find("=") {
+                let name = piece.substring(from: 0, to: eq).trim()
+                var value = piece.substring(from: eq + 1, to: piece.count).trim()
+                if value.count >= 2 && value.hasPrefix("\"") && value.hasSuffix("\"") {
+                    value = value.substring(from: 1, to: value.count - 1)
+                }
+                if !name.isEmpty && out[name] == nil {
+                    out[name] = pathDecoded(value)
+                }
+            }
+        }
+        out
+    }
+
+    // One cookie's value.
+    fn cookie(_ name: String) -> String? {
+        cookies()[name]
+    }
+
+    // Whether the client takes `type` ("text/html", "application/json"),
+    // by its Accept header. No Accept header takes anything.
+    fn accepts(_ type: String) -> Bool {
+        let accept = header("accept") ?? ""
+        if accept.trim().isEmpty {
+            return true
+        }
+        let want = type.lowercase()
+        let slash = want.find("/") ?? want.count
+        let family = want.substring(from: 0, to: slash) + "/*"
+        for item in accept.split(",") {
+            let parts = item.split(";")
+            let name = parts[0].trim().lowercase()
+            var q = 1.0
+            for p in parts {
+                let t = p.trim()
+                if t.hasPrefix("q=") {
+                    q = Float(t.substring(from: 2, to: t.count)) ?? 1.0
+                }
+            }
+            if q > 0 && (name == want || name == family || name == "*/*") {
+                return true
+            }
+        }
+        false
+    }
+}
+
+
+// The body read as JSON into a value of your type, or `nil` if it isn't
+// JSON of that shape: `let item: Item? = web.readJson(request)`.
+public fn readJson<T>(_ request: Request) -> T? {
+    fromJson(request.text())
+}
+
+// The encoded path parts a route's `*name` took (for the files of a folder).
+fn restOf(_ request: Request) -> [String] {
+    request.rest
+}
+
+fn withRest(_ request: Request, _ rest: [String]) -> Request {
+    var r = request
+    r.rest = rest
+    r
+}
+
+// One part of a multipart/form-data body.
+public struct Part {
+    // The form field's name.
+    name: String
+    // The uploaded file's name, or nil for an ordinary field.
+    fileName: String? = nil
+    // The part's content type ("text/plain" if it gave none).
+    contentType: String = "text/plain"
+    data: Data = Data()
+}
+
+// The `name=value` pairs of a query or urlencoded form, decoded. A pair
+// without `=` has the value "".
+fn formPairs(_ text: String) -> [(String, String)] {
+    var out: [(String, String)] = []
+    if text.isEmpty {
+        return out
+    }
+    for piece in text.split("&") {
+        if piece.isEmpty {
+            continue
+        }
+        if let eq = piece.find("=") {
+            let key = piece.substring(from: 0, to: eq)
+            let value = piece.substring(from: eq + 1, to: piece.count)
+            out.append((key.urlDecoded ?? key, value.urlDecoded ?? value))
+        } else {
+            out.append((piece.urlDecoded ?? piece, ""))
+        }
+    }
+    out
+}
+
+// A parameter of a header value: `boundary` of
+// `multipart/form-data; boundary=xyz`, without quotes. "" if missing.
+fn headerParameter(_ value: String, _ name: String) -> String {
+    let parts = value.split(";")
+    var i = 1
+    while i < parts.count {
+        let p = parts[i].trim()
+        if let eq = p.find("=") {
+            if p.substring(from: 0, to: eq).trim().lowercase() == name {
+                var v = p.substring(from: eq + 1, to: p.count).trim()
+                if v.count >= 2 && v.hasPrefix("\"") && v.hasSuffix("\"") {
+                    v = v.substring(from: 1, to: v.count - 1).replace("\\\"", with: "\"")
+                }
+                return v
+            }
+        }
+        i += 1
+    }
+    ""
+}
+
+// Where `needle` first appears in `data` at or after `from`, or -1.
+fn findBytes(_ data: Data, _ needle: Data, from: Int) -> Int {
+    let n = needle.count
+    if n == 0 {
+        return from
+    }
+    let first = needle[0]
+    var i = max(from, 0)
+    let last = data.count - n
+    while i <= last {
+        if data[i] == first {
+            var k = 1
+            while k < n && data[i + k] == needle[k] {
+                k += 1
+            }
+            if k == n {
+                return i
+            }
+        }
+        i += 1
+    }
+    -1
+}
+
+// The parts of a multipart body: each starts after `--boundary` and a line
+// break, has headers up to an empty line, then its bytes up to the line
+// break before the next `--boundary`.
+fn multipartParts(_ body: Data, _ boundary: String) -> [Part] {
+    var out: [Part] = []
+    let marker = Data(text: "--" + boundary)
+    let next = Data(text: "\r\n--" + boundary)
+    let blank = Data(text: "\r\n\r\n")
+    var at = findBytes(body, marker, from: 0)
+    if at < 0 {
+        return out
+    }
+    at += marker.count
+    while at + 2 <= body.count {
+        // `--` after the boundary ends the body.
+        if body[at] == 45 && body[at + 1] == 45 {
+            break
+        }
+        // Skip to the end of the boundary's line.
+        let lineEnd = findBytes(body, Data(text: "\r\n"), from: at)
+        if lineEnd < 0 {
+            break
+        }
+        let headStart = lineEnd + 2
+        let headEnd = findBytes(body, blank, from: headStart)
+        if headEnd < 0 {
+            break
+        }
+        let end = findBytes(body, next, from: headEnd + 4)
+        if end < 0 {
+            break
+        }
+        let head = body.slice(from: headStart, to: headEnd).text ?? ""
+        var part = Part(name: "")
+        for line in head.split("\r\n") {
+            if let colon = line.find(":") {
+                let name = line.substring(from: 0, to: colon).trim().lowercase()
+                let value = line.substring(from: colon + 1, to: line.count).trim()
+                if name == "content-disposition" {
+                    part.name = headerParameter(value, "name")
+                    if value.lowercase().contains("filename=") {
+                        part.fileName = headerParameter(value, "filename")
+                    }
+                } else if name == "content-type" {
+                    part.contentType = value
+                }
+            }
+        }
+        part.data = body.slice(from: headEnd + 4, to: end)
+        out.append(part)
+        at = end + next.count
+    }
+    out
+}

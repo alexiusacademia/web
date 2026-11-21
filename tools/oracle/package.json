@@ -1,0 +1,8 @@
+{
+  "name": "web-template-oracle",
+  "private": true,
+  "description": "Writes tests/templates.json: templates rendered by Handlebars, for checking web's templates",
+  "dependencies": {
+    "handlebars": "4.7.8"
+  }
+}

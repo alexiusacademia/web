@@ -1,0 +1,296 @@
+// web: the values templates show. A program's data (any struct, list or
+// dictionary) becomes JSON with `toJson`, and is read back here as a tree
+// of Values that templates look names up in.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// A JSON value. Objects keep their keys in order.
+enum Value {
+    null
+    bool(value: Bool)
+    // A number as JSON wrote it, so it's shown the same way.
+    number(text: String)
+    string(value: String)
+    list(items: [Value])
+    object(keys: [String], values: [Value])
+}
+
+// A program's value as a Value.
+fn toValue<T>(_ data: T) -> Value {
+    parseJson(toJson(data)) ?? Value.null
+}
+
+// Reads JSON text, or nil if it isn't valid JSON.
+fn parseJson(_ text: String) -> Value? {
+    var reader = JsonReader(chars: text.characters)
+    reader.skipSpace()
+    if let v = reader.value() {
+        reader.skipSpace()
+        if reader.at == reader.chars.count {
+            return v
+        }
+    }
+    nil
+}
+
+// Reads JSON from its characters.
+struct JsonReader {
+    chars: [String]
+    at: Int = 0
+    depth: Int = 0
+
+    fn peek() -> String {
+        if at < chars.count { chars[at] } else { "" }
+    }
+
+    fn skipSpace() {
+        while at < chars.count {
+            let c = chars[at]
+            if c != " " && c != "\n" && c != "\r" && c != "\t" {
+                return
+            }
+            at += 1
+        }
+    }
+
+    // Whether the next characters are `word`, taking them if they are.
+    fn take(_ word: String) -> Bool {
+        let w = word.characters
+        if at + w.count > chars.count {
+            return false
+        }
+        for i in 0..w.count {
+            if chars[at + i] != w[i] {
+                return false
+            }
+        }
+        at += w.count
+        true
+    }
+
+    fn value() -> Value? {
+        let c = peek()
+        if c == "\{" {
+            return object()
+        }
+        if c == "[" {
+            return list()
+        }
+        if c == "\"" {
+            if let s = string() {
+                return Value.string(value: s)
+            }
+            return nil
+        }
+        if take("true") {
+            return Value.bool(value: true)
+        }
+        if take("false") {
+            return Value.bool(value: false)
+        }
+        if take("null") {
+            return Value.null
+        }
+        number()
+    }
+
+    fn object() -> Value? {
+        depth += 1
+        if depth > 500 {
+            return nil
+        }
+        at += 1
+        var keys: [String] = []
+        var values: [Value] = []
+        skipSpace()
+        if peek() == "}" {
+            at += 1
+            depth -= 1
+            return Value.object(keys: keys, values: values)
+        }
+        while true {
+            skipSpace()
+            if peek() != "\"" {
+                return nil
+            }
+            let key = string() ?? ""
+            skipSpace()
+            if peek() != ":" {
+                return nil
+            }
+            at += 1
+            skipSpace()
+            if let v = value() {
+                keys.append(key)
+                values.append(v)
+            } else {
+                return nil
+            }
+            skipSpace()
+            let c = peek()
+            at += 1
+            if c == "}" {
+                depth -= 1
+                return Value.object(keys: keys, values: values)
+            }
+            if c != "," {
+                return nil
+            }
+        }
+        nil
+    }
+
+    fn list() -> Value? {
+        depth += 1
+        if depth > 500 {
+            return nil
+        }
+        at += 1
+        var items: [Value] = []
+        skipSpace()
+        if peek() == "]" {
+            at += 1
+            depth -= 1
+            return Value.list(items: items)
+        }
+        while true {
+            skipSpace()
+            if let v = value() {
+                items.append(v)
+            } else {
+                return nil
+            }
+            skipSpace()
+            let c = peek()
+            at += 1
+            if c == "]" {
+                depth -= 1
+                return Value.list(items: items)
+            }
+            if c != "," {
+                return nil
+            }
+        }
+        nil
+    }
+
+    fn string() -> String? {
+        at += 1
+        var parts: [String] = []
+        while at < chars.count {
+            let c = chars[at]
+            at += 1
+            if c == "\"" {
+                return parts.joined(separator: "")
+            }
+            if c != "\\" {
+                parts.append(c)
+                continue
+            }
+            let e = peek()
+            at += 1
+            match e {
+                "\"" -> parts.append("\"")
+                "\\" -> parts.append("\\")
+                "/" -> parts.append("/")
+                "b" -> parts.append(Data(bytes: [8]).text ?? "")
+                "f" -> parts.append(Data(bytes: [12]).text ?? "")
+                "n" -> parts.append("\n")
+                "r" -> parts.append("\r")
+                "t" -> parts.append("\t")
+                "u" -> {
+                    var code = hex4()
+                    if code < 0 {
+                        return nil
+                    }
+                    // A surrogate pair: two \u codes for one character.
+                    if code >= 0xD800 && code < 0xDC00 && take("\\u") {
+                        let low = hex4()
+                        if low >= 0xDC00 && low < 0xE000 {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                        } else {
+                            code = 0xFFFD
+                        }
+                    } else if code >= 0xD800 && code < 0xE000 {
+                        code = 0xFFFD
+                    }
+                    parts.append(codePointText(code))
+                }
+                _ -> { return nil }
+            }
+        }
+        nil
+    }
+
+    // Four hex digits as a number, or -1.
+    fn hex4() -> Int {
+        var n = 0
+        for _ in 0..4 {
+            let d = hexDigit(peek())
+            if d < 0 {
+                return -1
+            }
+            n = n * 16 + d
+            at += 1
+        }
+        n
+    }
+
+    fn number() -> Value? {
+        let start = at
+        while at < chars.count && "+-0123456789.eE".contains(chars[at]) {
+            at += 1
+        }
+        if at == start {
+            return nil
+        }
+        var parts: [String] = []
+        for i in start..at {
+            parts.append(chars[i])
+        }
+        let text = parts.joined(separator: "")
+        if Float(text) == nil {
+            return nil
+        }
+        Value.number(text: text)
+    }
+}
+
+fn hexDigit(_ c: String) -> Int {
+    let i = "0123456789abcdef".find(c.lowercase()) ?? -1
+    if c.count != 1 { -1 } else { i }
+}
+
+// One character from its code point, made from its UTF-8 bytes.
+fn codePointText(_ code: Int) -> String {
+    var bytes: [Int] = []
+    if code < 0x80 {
+        bytes = [code]
+    } else if code < 0x800 {
+        bytes = [0xC0 | (code >> 6), 0x80 | (code & 0x3F)]
+    } else if code < 0x10000 {
+        bytes = [0xE0 | (code >> 12), 0x80 | ((code >> 6) & 0x3F), 0x80 | (code & 0x3F)]
+    } else {
+        bytes = [0xF0 | (code >> 18), 0x80 | ((code >> 12) & 0x3F), 0x80 | ((code >> 6) & 0x3F), 0x80 | (code & 0x3F)]
+    }
+    Data(bytes: bytes).text ?? ""
+}
+
+// A Value as JSON text again (for showing a list or an object).
+fn jsonText(_ v: Value) -> String {
+    match v {
+        .null -> "null"
+        .bool(b) -> if b { "true" } else { "false" }
+        .number(t) -> t
+        .string(s) -> toJson(s)
+        .list(items) -> "[" + items.map({ i in jsonText(i) }).joined(separator: ",") + "]"
+        .object(keys, values) -> {
+            var parts: [String] = []
+            for i in 0..keys.count {
+                parts.append(toJson(keys[i]) + ":" + jsonText(values[i]))
+            }
+            "\{" + parts.joined(separator: ",") + "}"
+        }
+    }
+}

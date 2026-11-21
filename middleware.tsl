@@ -1,0 +1,238 @@
+// web: ready-made middleware: a request log, CORS, passwords (Basic
+// authentication), gzip, security headers, a body size limit and signed
+// cookie sessions.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// Prints a line for each request when it's answered:
+// `127.0.0.1 GET /users/3 200 512 B 0.12 ms`.
+public fn logger() -> Middleware {
+    onResponse { request, response in
+        let ms = (now() - request.received) * 1000
+        let host = request.remote.substring(from: 0, to: request.remote.findLast(":") ?? request.remote.count)
+        let target = if request.query.isEmpty { request.path } else { request.path + "?" + request.query }
+        print("{host} {request.method} {target} {response.status} {response.body.count} B {ms.formatted(decimals: 2)} ms")
+        response
+    }
+}
+
+// Lets pages from other sites call this server from a browser. `origins`
+// are the sites allowed ("https://example.com"), or ["*"] for any; with
+// `credentials`, browsers send cookies too (and "*" answers with the
+// asking site instead). Answers preflight OPTIONS requests itself.
+public fn cors(origins: [String] = ["*"], methods: [String] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
+               headers: [String] = [], credentials: Bool = false, maxAge: Int = 600) -> Middleware {
+    Middleware(before: { request in
+        let origin = request.header("origin") ?? ""
+        let asked = request.header("access-control-request-method") ?? ""
+        if request.method == "OPTIONS" && !origin.isEmpty && !asked.isEmpty {
+            var response = Response(status: 204)
+            if let allowed = allowedOrigin(origin, origins, credentials) {
+                response = corsHeaders(response, allowed, credentials)
+                response = response.withHeader("Access-Control-Allow-Methods", methods.joined(separator: ", "))
+                let wanted = if headers.isEmpty { request.header("access-control-request-headers") ?? "" } else { headers.joined(separator: ", ") }
+                if !wanted.isEmpty {
+                    response = response.withHeader("Access-Control-Allow-Headers", wanted)
+                }
+                response = response.withHeader("Access-Control-Max-Age", "{maxAge}")
+            }
+            return Step.stop(response: response)
+        }
+        Step.next(request: request)
+    }, after: { request, response in
+        let origin = request.header("origin") ?? ""
+        if origin.isEmpty {
+            return response
+        }
+        if let allowed = allowedOrigin(origin, origins, credentials) {
+            return corsHeaders(response, allowed, credentials)
+        }
+        response
+    })
+}
+
+// The Access-Control-Allow-Origin to send for `origin`, or nil if it
+// isn't allowed.
+fn allowedOrigin(_ origin: String, _ origins: [String], _ credentials: Bool) -> String? {
+    if origins.contains("*") {
+        return if credentials { origin } else { "*" }
+    }
+    if origins.contains(origin) {
+        return origin
+    }
+    nil
+}
+
+fn corsHeaders(_ response: Response, _ allowed: String, _ credentials: Bool) -> Response {
+    var r = response.withHeader("Access-Control-Allow-Origin", allowed)
+    if allowed != "*" {
+        r = r.withHeader("Vary", "Origin")
+    }
+    if credentials {
+        r = r.withHeader("Access-Control-Allow-Credentials", "true")
+    }
+    r
+}
+
+// Asks for a name and password (HTTP Basic authentication) and lets in
+// only those `check` accepts. The name is in `request.values["user"]`.
+// Use it only over HTTPS: the password is sent as plain text.
+public fn basicAuth(realm: String = "Restricted", check: fn(String, String) -> Bool) -> Middleware {
+    onRequest { request in
+        let given = request.header("authorization") ?? ""
+        if given.lowercase().hasPrefix("basic ") {
+            let decoded = decodeBase64(given.substring(from: 6, to: given.count).trim())?.text ?? ""
+            if let colon = decoded.find(":") {
+                let user = decoded.substring(from: 0, to: colon)
+                let password = decoded.substring(from: colon + 1, to: decoded.count)
+                if check(user, password) {
+                    var passed = request
+                    passed.values["user"] = user
+                    return Step.next(request: passed)
+                }
+            }
+        }
+        let quoted = realm.replace("\"", with: "'")
+        Step.stop(response: status(401).withHeader("WWW-Authenticate", "Basic realm=\"{quoted}\", charset=\"UTF-8\""))
+    }
+}
+
+// Compresses answers with gzip for clients that take it: text, HTML, CSS,
+// JavaScript, JSON, XML and SVG of at least `minimum` bytes.
+public fn compress(minimum: Int = 1024) -> Middleware {
+    onResponse { request, response in
+        let accept = (request.header("accept-encoding") ?? "").lowercase()
+        if !acceptsGzip(accept) || response.body.count < minimum || response.header("content-encoding") != nil {
+            return response
+        }
+        if response.status != 200 || request.method == "HEAD" {
+            return response
+        }
+        let type = (response.header("content-type") ?? "").lowercase()
+        if !compressible(type) {
+            return response
+        }
+        var r = response
+        r.body = response.body.compressed("gzip")
+        r = r.withHeader("Content-Encoding", "gzip")
+        // Ranges count the bytes as they were.
+        r.headers = withoutHeader(r.headers, "accept-ranges")
+        let vary = response.header("vary") ?? ""
+        r = r.withHeader("Vary", if vary.isEmpty { "Accept-Encoding" } else { vary + ", Accept-Encoding" })
+        if let tag = response.header("etag") {
+            // The compressed bytes are different bytes.
+            if !tag.hasPrefix("W/") {
+                r = r.withHeader("ETag", "W/" + tag)
+            }
+        }
+        r
+    }
+}
+
+// Whether an Accept-Encoding header takes gzip (and doesn't say q=0).
+fn acceptsGzip(_ accept: String) -> Bool {
+    for item in accept.split(",") {
+        let parts = item.split(";")
+        let name = parts[0].trim()
+        if name == "gzip" || name == "*" {
+            var ok = true
+            for p in parts {
+                let t = p.trim().replace(" ", with: "")
+                if t == "q=0" || t == "q=0.0" || t == "q=0.00" || t == "q=0.000" {
+                    ok = false
+                }
+            }
+            return ok
+        }
+    }
+    false
+}
+
+fn compressible(_ type: String) -> Bool {
+    type.hasPrefix("text/") || type.contains("json") || type.contains("javascript") ||
+        type.contains("xml") || type.contains("svg")
+}
+
+// Headers that make browsers stricter about the pages: no guessing content
+// types, no showing them in other sites' frames, no full addresses sent to
+// other sites, and a content security policy if one is given.
+public fn securityHeaders(contentSecurityPolicy: String = "") -> Middleware {
+    onResponse { request, response in
+        var r = response
+        if r.header("x-content-type-options") == nil {
+            r = r.withHeader("X-Content-Type-Options", "nosniff")
+        }
+        if r.header("x-frame-options") == nil {
+            r = r.withHeader("X-Frame-Options", "DENY")
+        }
+        if r.header("referrer-policy") == nil {
+            r = r.withHeader("Referrer-Policy", "strict-origin-when-cross-origin")
+        }
+        if !contentSecurityPolicy.isEmpty && r.header("content-security-policy") == nil {
+            r = r.withHeader("Content-Security-Policy", contentSecurityPolicy)
+        }
+        r
+    }
+}
+
+// Refuses bodies of more than `bytes` with a 413.
+public fn bodyLimit(_ bytes: Int) -> Middleware {
+    onRequest { request in
+        if request.body.count > bytes {
+            return Step.stop(response: status(413))
+        }
+        Step.next(request: request)
+    }
+}
+
+// Sessions kept in a signed cookie: handlers read `request.session` and
+// save it with `response.withSession(…)`. The cookie holds the values
+// themselves (readable by the user, but not changeable without `secret`),
+// so keep them small (a browser takes about 4 KB) and never put secrets
+// in them. `secret` should be long and random, and kept out of the code;
+// changing it ends every session. `maxAge` is in seconds.
+public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 1209600,
+                   secure: Bool = false, sameSite: String = "Lax") -> Middleware {
+    if secret.count < 16 {
+        print("web: a session secret must be at least 16 characters")
+        exit(1)
+    }
+    Middleware(before: { request in
+        var passed = request
+        if let raw = request.cookie(cookie) {
+            if let payload = unsign(raw, secret: secret) {
+                if let bytes = decodeBase64(fromBase64Url(payload)) {
+                    let saved: SavedSession? = fromJson(bytes.text ?? "")
+                    if let s = saved {
+                        if s.expires > now() {
+                            passed.session = s.values
+                        }
+                    }
+                }
+            }
+        }
+        Step.next(request: passed)
+    }, after: { request, response in
+        if let values = response.session {
+            var r = response
+            r.session = nil
+            if values.isEmpty {
+                if request.cookie(cookie) == nil {
+                    return r
+                }
+                return r.withoutCookie(cookie)
+            }
+            let saved = SavedSession(values: values, expires: now() + Float(maxAge))
+            let payload = toBase64Url(Data(text: toJson(saved)).base64)
+            return r.withCookie(cookie, sign(payload, secret: secret), maxAge: maxAge, secure: secure, sameSite: sameSite)
+        }
+        response
+    })
+}
+
+// A session as its cookie holds it.
+struct SavedSession {
+    values: [String: String]
+    expires: Float
+}

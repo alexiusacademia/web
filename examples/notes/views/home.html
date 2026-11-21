@@ -1,0 +1,24 @@
+<h1>{{title}}</h1>
+{{#if error}}
+<p class="error">{{error}}</p>
+{{/if}}
+{{#if user}}
+<form method="post" action="/notes">
+  <input name="text" placeholder="A note from {{user}}" autofocus>
+  <button>Add</button>
+</form>
+<form method="post" action="/logout"><button class="link">Sign out {{user}}</button></form>
+{{else}}
+<form method="post" action="/login">
+  <input name="name" placeholder="Your name">
+  <input name="password" type="password" placeholder="Password">
+  <button>Sign in</button>
+</form>
+{{/if}}
+<ul>
+  {{#each notes}}
+  {{> note}}
+  {{else}}
+  <li>No notes yet.</li>
+  {{/each}}
+</ul>

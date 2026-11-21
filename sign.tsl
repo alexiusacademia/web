@@ -1,0 +1,82 @@
+// web: signing values (HMAC-SHA256), for cookies the user can read but
+// not change.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// The HMAC of `message` with `key` (RFC 2104), with SHA-256 by default or
+// another algorithm `Data.hash` knows ("sha1", "sha512", …).
+public fn hmac(key: Data, message: Data, algorithm: String = "sha256") -> Data {
+    let block = blockSize(algorithm)
+    var k = if key.count > block { key.hash(algorithm) } else { key }
+    while k.count < block {
+        k.append(byte: 0)
+    }
+    var inner = Data()
+    var outer = Data()
+    for i in 0..block {
+        inner.append(byte: k[i] ^ 0x36)
+        outer.append(byte: k[i] ^ 0x5c)
+    }
+    inner += message
+    outer += inner.hash(algorithm)
+    outer.hash(algorithm)
+}
+
+// The block size of a hash in bytes: 128 for SHA-384 and SHA-512, 64 for
+// the others.
+fn blockSize(_ algorithm: String) -> Int {
+    let a = algorithm.lowercase().replace("-", with: "")
+    if a == "sha384" || a == "sha512" {
+        return 128
+    }
+    64
+}
+
+// `value` with its signature: "value.signature". Anyone can read the value;
+// only someone with `secret` can make a signature that `unsign` accepts.
+public fn sign(_ value: String, secret: String) -> String {
+    value + "." + toBase64Url(hmac(key: Data(text: secret), message: Data(text: value)).base64)
+}
+
+// The value of a `sign`ed text, or nil if its signature isn't right.
+public fn unsign(_ signed: String, secret: String) -> String? {
+    if let dot = signed.findLast(".") {
+        let value = signed.substring(from: 0, to: dot)
+        let given = signed.substring(from: dot + 1, to: signed.count)
+        let expected = toBase64Url(hmac(key: Data(text: secret), message: Data(text: value)).base64)
+        if sameText(given, expected) {
+            return value
+        }
+    }
+    nil
+}
+
+// Whether two texts are the same, taking the same time wherever they
+// differ, so the time taken doesn't give a signature away.
+fn sameText(_ a: String, _ b: String) -> Bool {
+    let x = Data(text: a)
+    let y = Data(text: b)
+    if x.count != y.count {
+        return false
+    }
+    var diff = 0
+    for i in 0..x.count {
+        diff = diff | (x[i] ^ y[i])
+    }
+    diff == 0
+}
+
+// Base64 as URLs and cookies take it: `-` and `_` for `+` and `/`, without
+// the `=` at the end.
+fn toBase64Url(_ base64: String) -> String {
+    base64.replace("+", with: "-").replace("/", with: "_").replace("=", with: "")
+}
+
+fn fromBase64Url(_ text: String) -> String {
+    var t = text.replace("-", with: "+").replace("_", with: "/")
+    while t.count % 4 != 0 {
+        t += "="
+    }
+    t
+}

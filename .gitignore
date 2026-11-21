@@ -1,0 +1,6 @@
+# What `tessel build` makes (and the IDE's Build and Package buttons).
+/web
+/web.exe
+*.app/
+.DS_Store
+node_modules/
