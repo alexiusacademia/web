@@ -192,7 +192,7 @@ one of the two; `web.Middleware(before:, after:)` has both.
 | `basicAuth(realm:) { user, password in … }` | Asks for a name and password; the name goes in `values["user"]`. Only over HTTPS. |
 | `sessions(secret:, cookie:, maxAge:, secure:, sameSite:, store:)` | Sessions, in a signed cookie or on the server. |
 | `csrf(secret:, cookie:, field:, header:, secure:)` | A token that forms must send back, so other sites can't post them. |
-| `rateLimit(requests:, seconds:, key:)` | A 429 for a client that asks too often. |
+| `rateLimit(requests:, seconds:, key:, maxClients:)` | A 429 for a client that asks too often. |
 | `proxy(trusted:)` | The client's real address and HTTPS behind a proxy. |
 | `compress(minimum:)` | gzip for text, HTML, CSS, JavaScript, JSON, XML and SVG, for clients that take it. |
 | `securityHeaders(contentSecurityPolicy:)` | `nosniff`, no framing, a strict referrer policy, and a CSP if given. |
@@ -207,7 +207,7 @@ router.post("/login") { r in
     if !passwordIsRight(form["name"] ?? "", form["password"] ?? "") {
         return web.redirect("/login?wrong", status: 303)
     }
-    web.redirect("/", status: 303).withSession(["user": form["name"] ?? ""])
+    web.redirect("/", status: 303).withSession(["user": form["name"] ?? ""], renew: true)
 }
 router.get("/") { r in web.text("Hello, {r.session["user"] ?? "stranger"}") }
 router.post("/logout") { r in web.redirect("/", status: 303).withSession([:]) }
@@ -224,9 +224,8 @@ it out of the code, and changing it ends every session. A session lasts
 ### Sessions on the server
 
 With a `store`, the values stay on the server and the cookie holds only a
-signed random id, which changes each time the session is saved (so an id
-seen before signing in is worthless after). Sessions can then be any
-size, and ended from the server:
+signed random id. Sessions can then be any size, and ended from the
+server:
 
 ```tessel
 let sessions = try web.databaseStore("sessions.db")      // or web.memoryStore()
@@ -236,7 +235,14 @@ router.use(web.sessions(secret: environment("SESSION_SECRET") ?? "", store: sess
 print(sessions.removeWhere { s in s["user"] == "ann" })
 ```
 
-`web.memoryStore()` keeps them in memory (they end with the program);
+The id stays the same as the session is saved, and
+`withSession(values, renew: true)` gives it a new one: do that when
+someone signs in, so an id anyone saw before is worthless after. A
+request that was on its way when its session ended (signed out, or by
+`removeWhere`) can't save it back.
+
+`web.memoryStore(limit:)` keeps them in memory (they end with the
+program; past `limit`, 100,000, the ones nearest their end go first);
 `web.databaseStore(path, table:)` keeps them in SQLite, so they last
 when the server restarts. A store is a struct of functions (`load`,
 `save`, `remove`, `removeWhere`, `count`), so a store for another
@@ -269,7 +275,7 @@ login.later("POST", "/login") { r, reply in
     let hash = hashFor(form["name"] ?? "")
     web.checkPasswordLater(form["password"] ?? "", hash) { ok in
         if ok {
-            reply(web.redirect("/", status: 303).withSession(["user": form["name"] ?? ""]))
+            reply(web.redirect("/", status: 303).withSession(["user": form["name"] ?? ""], renew: true))
         } else {
             reply(web.redirect("/login?wrong", status: 303))
         }
@@ -278,18 +284,37 @@ login.later("POST", "/login") { r, reply in
 ```
 
 `web.hashPasswordLater(password) { hash in … }` is the same for making
-one. `web.randomToken()` gives 43 random characters for a reset link or an
-API key, and `web.pbkdf2(password:salt:iterations:length:)` is there for
-keys of your own.
+one, and `web.pbkdf2(password:salt:iterations:length:)` (on `Data`) is
+there for keys of your own.
+
+## Random tokens
+
+```tessel
+let tokens = web.tokens(secret: environment("TOKEN_SECRET") ?? "")   // once, at the start
+router.post("/reset") { r in
+    let link = "https://example.com/reset/{tokens.token()}"     // 43 random characters
+    …
+}
+```
+
+Tessel 0.23 has no function for the system's secure random numbers yet,
+so `web.tokens()` reads 64 bytes from it once, a few milliseconds after
+it's made (with `od` and `/dev/urandom` on macOS and Linux, and
+PowerShell on Windows), and makes each token from them with HMAC-SHA256.
+Make it when the program starts and keep it; `isSeeded()` says whether
+the bytes have arrived. Tokens made before that, or if the bytes can't be
+read (which is said on the error output), rest on `secret`, so give a
+long random one. Sessions and CSRF make their own.
 
 ## Forms from other sites (CSRF)
 
 A page on another site can post a form to yours, and the browser sends
-your cookies with it. `web.csrf` stops that: each browser gets a token
-in a signed cookie, and a POST, PUT, PATCH or DELETE without the same
-token in the form (`_csrf`) or a header (`X-CSRF-Token`) gets a 403.
+your cookies with it. `web.csrf` stops that: a request with any method
+but GET, HEAD and OPTIONS must send back a token, in the form (`_csrf`)
+or a header (`X-CSRF-Token`), or it gets a 403.
 
 ```tessel
+router.use(web.sessions(secret: environment("SESSION_SECRET") ?? "", store: web.memoryStore()))
 router.use(web.csrf(secret: environment("CSRF_SECRET") ?? ""))
 router.get("/") { r in web.html("<form method=\"post\">{web.csrfField(r)}<button>Go</button></form>") }
 ```
@@ -299,6 +324,11 @@ in each form; from JavaScript, send `web.csrfToken(r)` as the
 `X-CSRF-Token` header. Use it for the pages and forms of a site, not for
 an API that other programs call (mount the two as separate routers).
 
+Once a visitor has a session, the token is kept in it (put `sessions`
+before `csrf`), so it belongs to that session, and signing in with
+`renew: true` gives a new one. Before that it's in a signed cookie, named
+`__Host-csrf` over HTTPS so other sites on the same domain can't set it.
+
 ## Rate limits
 
 ```tessel
@@ -307,9 +337,11 @@ login.use(web.rateLimit(requests: 5, seconds: 60))     // per IP address
 ```
 
 A client that asks more often gets a 429 with `Retry-After`; answers say
-how many are left (`RateLimit-Remaining`). `key:` counts by something
-else than the IP address: `key: { r in r.header("x-api-key") ?? "" }`.
-The counts are in memory, for one server.
+how many are left (`RateLimit-Remaining`). An IPv6 address counts by its
+/64 network, since one client usually has all of it. `key:` counts by
+something else than the IP address: `key: { r in r.header("x-api-key") ?? "" }`.
+The counts are in memory, for one server, for at most `maxClients`
+(100,000) clients at a time.
 
 ## Running it for real
 

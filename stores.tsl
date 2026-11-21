@@ -22,17 +22,18 @@ public struct SessionStore {
     count: fn() -> Int
 }
 
-// Sessions in memory: they end when the program does.
-public fn memoryStore() -> SessionStore {
+// Sessions in memory: they end when the program does. At most `limit`
+// are kept: past it, the ones nearest their end go first.
+public fn memoryStore(limit: Int = 100000) -> SessionStore {
     var items: [String: StoredSession] = [:]
     var lastSweep = now()
     SessionStore(load: { id in
         items[id]
     }, save: { id, session in
         items[id] = session
-        // Forget ended sessions now and then.
+        // Forget ended sessions now and then, and when there are too many.
         let t = now()
-        if t - lastSweep > 60 {
+        if t - lastSweep > 60 || items.count > limit {
             var kept: [String: StoredSession] = [:]
             for (k, s) in items {
                 if s.expires > t {
@@ -41,6 +42,15 @@ public fn memoryStore() -> SessionStore {
             }
             items = kept
             lastSweep = t
+            if items.count > limit {
+                // Keep the 90% that last longest.
+                let order = items.keys.sorted(by: { x, y in (items[x]?.expires ?? 0) > (items[y]?.expires ?? 0) })
+                var trimmed: [String: StoredSession] = [:]
+                for k in order.slice(from: 0, to: limit * 9 / 10) {
+                    trimmed[k] = items[k]
+                }
+                items = trimmed
+            }
         }
     }, remove: { id in
         items[id] = nil

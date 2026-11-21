@@ -10,13 +10,13 @@
   <meta name="author" content="Alexius Academia">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>web · Web servers for Tessel</title>
-  <meta name="description" content="web is a Tessel library for web servers: routes with values in the path, middleware, forms, uploads, cookies, signed sessions, static files and HTML templates.">
+  <meta name="description" content="web is a Tessel library for web servers: routes with values in the path, middleware, forms, uploads, cookies, sessions, password hashes, CSRF tokens, rate limits, static files and HTML templates.">
   <meta name="theme-color" content="#c93045">
   <link rel="canonical" href="https://web-package.syncster.dev/">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="web">
   <meta property="og:title" content="web · Web servers for Tessel">
-  <meta property="og:description" content="Routes, middleware, forms, cookies, signed sessions, static files and Handlebars-style templates for Tessel programs. Nothing else to install.">
+  <meta property="og:description" content="Routes, middleware, forms, cookies, sessions, password hashes, CSRF tokens, rate limits, static files and Handlebars-style templates for Tessel programs. Nothing else to install.">
   <meta property="og:url" content="https://web-package.syncster.dev/">
   <meta property="og:image" content="https://web-package.syncster.dev/assets/share.png">
   <meta property="og:image:width" content="1200">
@@ -39,6 +39,7 @@
     </a>
     <nav>
       <a href="#examples">Examples</a>
+      <a href="#running" class="optional">Running it</a>
       <a href="#tested" class="optional">Tested</a>
       <a href="#reference">Reference</a>
       <a href="https://github.com/alexiusacademia/web">GitHub</a>
@@ -53,7 +54,7 @@
     <div>
       <p class="eyebrow">A Tessel library</p>
       <h1>Web servers in a few lines of Tessel.</h1>
-      <p class="lede">Routes with values in the path, middleware, forms, uploads, cookies, signed sessions, folders of static files and HTML templates. It's built on Tessel's own HTTP server, with nothing else to install.</p>
+      <p class="lede">Routes with values in the path, middleware, forms, uploads, cookies, sessions, password hashes, CSRF tokens, rate limits, folders of static files and HTML templates. It's built on Tessel's own HTTP server, with nothing else to install.</p>
       <div class="install">
         <code>tessel add web</code>
         <button class="copy" type="button" data-copy="tessel add web">Copy</button>
@@ -62,7 +63,7 @@
         <a class="button primary" href="#examples">See examples</a>
         <a class="button" href="https://github.com/alexiusacademia/web">Code on GitHub</a>
       </div>
-      <p class="meta">MIT licence · Tessel 0.23.1 or later · no dependencies</p>
+      <p class="meta">Version 0.2.0 · MIT licence · Tessel 0.23.1 or later · no dependencies</p>
     </div>
     <div class="preview">
       <div class="panel">
@@ -212,44 +213,90 @@ cat.gif: 17 bytes of image/gif</pre>
         </div>
       </article>
 
-      <article class="example" id="sessions">
-        <h3>Signing in with a session</h3>
-        <p>The session's values are kept in a cookie signed with HMAC-SHA256, so they can't be changed without the secret. They can be read, so never put a password in them. The secret must be at least 16 characters; keep it out of the code.</p>
+      <article class="example" id="signing-in">
+        <h3>Signing in, safely</h3>
+        <p>Keep a hash of each password, not the password: <code>web.hashPassword</code> takes about half a second on purpose, so <code>checkPasswordLater</code> checks it on another thread in a <code>later</code> route while other requests go on. With a <code>store</code>, the session stays on the server and the cookie holds only a signed random id. <code>web.csrf</code> gives a 403 to a form without the page's token, so other sites can't post it, and <code>rateLimit</code> allows 3 tries a minute.</p>
         <div class="split">
           <div>
 <pre class="tsl">import web
 
 fn main() {
+    let secret = environment("SECRET") ?? ""
+    let users = ["ann": web.hashPassword("tessel")]   // a database, really
+
     var router = web.Router()
-    router.use(web.sessions(secret: environment("SESSION_SECRET") ?? ""))
-    router.post("/login") { r in
-        let form = r.form()
-        if form["password"] != "tessel" {
-            return web.redirect("/?wrong", status: 303)
-        }
-        web.redirect("/", status: 303).withSession(["user": form["name"] ?? ""])
+    router.use(web.proxy())
+    router.use(web.sessions(secret: secret, store: web.memoryStore()))
+    router.use(web.csrf(secret: secret))
+    router.get("/") { r in
+        let fields = "&lt;input name=\"name\"&gt;&lt;input name=\"password\" type=\"password\"&gt;&lt;button&gt;Sign in&lt;/button&gt;"
+        let form = "&lt;form method=\"post\" action=\"/login\"&gt;{web.csrfField(r)}{fields}&lt;/form&gt;"
+        web.html("&lt;p&gt;Hello, {r.session["user"] ?? "stranger"}&lt;/p&gt;\n{form}")
     }
-    router.get("/") { r in web.text("Hello, {r.session["user"] ?? "stranger"}") }
-    router.post("/logout") { r in web.redirect("/", status: 303).withSession([:]) }
+
+    var login = web.Router()
+    login.use(web.rateLimit(requests: 3, seconds: 60))
+    login.later("POST", "/login") { r, reply in
+        let form = r.form()
+        let name = form["name"] ?? ""
+        web.checkPasswordLater(form["password"] ?? "", users[name] ?? "none") { ok in
+            if ok {
+                reply(web.redirect("/", status: 303).withSession(["user": name], renew: true))
+            } else {
+                reply(web.redirect("/?wrong", status: 303))
+            }
+        }
+    }
+    router.mount("", login)
     web.serve(router, port: 8080)
 }</pre>
           </div>
           <div class="out">
             <p class="label">With curl, keeping cookies in a jar</p>
-<pre class="http">$ curl 127.0.0.1:8080/
-Hello, stranger
-$ curl -i -c jar -d 'name=Ann&amp;password=tessel' 127.0.0.1:8080/login
+<pre class="http">$ curl -c jar 127.0.0.1:8080/
+&lt;p&gt;Hello, stranger&lt;/p&gt;
+&lt;form method="post" action="/login"&gt;&lt;input type="hidden" name="_csrf" value="PM5E1cpBhC7zR8HChRvYrBBdp8EpJUpRR82x58k85ng"&gt;&lt;input name="name"&gt;&lt;input name="password" type="password"&gt;&lt;button&gt;Sign in&lt;/button&gt;&lt;/form&gt;
+$ curl -i -b jar -d 'name=ann&amp;password=tessel' 127.0.0.1:8080/login
+HTTP/1.1 403 Forbidden
+Content-Type: text/plain; charset=utf-8
+Content-Length: 80
+
+The form is out of date or came from another site: reload the page and try again
+$ T=PM5E1cpBhC7zR8HChRvYrBBdp8EpJUpRR82x58k85ng
+$ curl -i -b jar -d "_csrf=$T&amp;name=ann&amp;password=Tessel" 127.0.0.1:8080/login
 HTTP/1.1 303 See Other
-Location: /
-Set-Cookie: session=eyJ2YWx1ZXMiOnsidXNlciI6IkFubiJ9LCJleHBpcmVzIjoxNzk2NDcwODYwLjQ4MTkyN30._TIa8ZHLsQqQm3YciECzdfBQp7h2d3FSVA9o9Hu1OKQ; Max-Age=1209600; Expires=Sat, 05 Dec 2026 11:41:00 GMT; Path=/; HttpOnly; SameSite=Lax
+Location: /?wrong
+RateLimit-Limit: 3
+RateLimit-Remaining: 2
+RateLimit-Reset: 60
 Content-Length: 0
 
-$ curl -b jar 127.0.0.1:8080/
-Hello, Ann
-$ curl -b jar -c jar -d '' 127.0.0.1:8080/logout
-$ curl -b jar 127.0.0.1:8080/
-Hello, stranger</pre>
-            <p class="note">A cookie with “Ann” changed to “Bob” and the old signature kept gets “Hello, stranger”.</p>
+$ curl -i -b jar -c jar -d "_csrf=$T&amp;name=ann&amp;password=tessel" 127.0.0.1:8080/login
+HTTP/1.1 303 See Other
+Location: /
+RateLimit-Limit: 3
+RateLimit-Remaining: 1
+RateLimit-Reset: 60
+Set-Cookie: session=VyKsiFAcOlPsFvgVCbkzv-U2wdihzvwC8Ti2c5l_vOI.Vq1Di9q4F8-9FsYlF9P9nRqQnmdL16ZcfXnmNm3YyFE; Max-Age=1209600; Expires=Sat, 05 Dec 2026 13:07:18 GMT; Path=/; HttpOnly; SameSite=Lax
+Content-Length: 0
+
+$ curl -s -b jar 127.0.0.1:8080/ | head -1
+&lt;p&gt;Hello, ann&lt;/p&gt;
+$ curl -b jar -d "_csrf=$T&amp;name=ann&amp;password=guess" 127.0.0.1:8080/login
+The form is out of date or came from another site: reload the page and try again
+$ T=$(curl -s -b jar 127.0.0.1:8080/ | grep -o '[A-Za-z0-9_-]\{43\}')
+$ curl -s -o /dev/null -b jar -d "_csrf=$T&amp;name=ann&amp;password=guess" 127.0.0.1:8080/login
+$ curl -i -b jar -d "_csrf=$T&amp;name=ann&amp;password=guess2" 127.0.0.1:8080/login
+HTTP/1.1 429 Too Many Requests
+Content-Type: text/plain; charset=utf-8
+Retry-After: 59
+RateLimit-Limit: 3
+RateLimit-Remaining: 0
+RateLimit-Reset: 59
+Content-Length: 17
+
+Too Many Requests</pre>
+            <p class="note">The cookie holds the session's id and its signature, nothing else. <code>renew: true</code> gives the session a new id and a new CSRF token at sign-in, so the token from before stops working. Without a <code>store</code>, <code>web.sessions</code> keeps the values in the signed cookie itself.</p>
           </div>
         </div>
       </article>
@@ -440,18 +487,56 @@ ok    other paths are not found  (8 ms)
       </article>
 
     </div>
-    <p class="note"><code>examples/notes</code> in the repository is a whole small site: pages from templates with a layout, a form, signing in with a session, a JSON API and a stylesheet.</p>
+    <p class="note"><code>examples/notes</code> in the repository is a whole small site: pages from templates with a layout, a form, a JSON API and a stylesheet, and signing in with hashed passwords checked by <code>checkPasswordLater</code>, sessions on the server, a CSRF token in every form, a rate limit on <code>/login</code> and <code>proxy()</code>.</p>
+  </div>
+</section>
+
+<section id="running">
+  <div class="wrap">
+    <h2>Running it for real</h2>
+    <p class="intro">The server speaks plain HTTP. On the internet, put it behind a proxy that does HTTPS, like Caddy, with the server on its default host, <code>127.0.0.1</code>, so only the proxy can reach it. Put <code>router.use(web.proxy())</code> first, so <code>r.ip</code> is the visitor's address (not the proxy's) and <code>r.secure</code> says they used HTTPS; cookies then want <code>secure: true</code>. Have systemd start it again if it stops.</p>
+    <div class="split">
+      <div>
+        <p class="label">Caddyfile</p>
+<pre>example.com {
+    reverse_proxy 127.0.0.1:8080
+}</pre>
+        <p class="note">With the systemd unit in place: <code>systemctl enable --now myapp</code>.</p>
+      </div>
+      <div>
+        <p class="label">/etc/systemd/system/myapp.service</p>
+<pre>[Unit]
+Description=My Tessel site
+After=network.target
+
+[Service]
+ExecStart=/srv/myapp/myapp
+WorkingDirectory=/srv/myapp
+Environment=SESSION_SECRET=… CSRF_SECRET=…
+Restart=always
+User=myapp
+
+[Install]
+WantedBy=multi-user.target</pre>
+      </div>
+    </div>
+    <h3>What it doesn't do (yet)</h3>
+    <div class="features">
+      <div class="feature"><b>One request at a time</b><span>The server answers on one thread. Keep long work off it: <code>background</code> for computing, <code>later</code> routes for answers that wait, <code>checkPasswordLater</code> for passwords.</span></div>
+      <div class="feature"><b>A crash stops the server</b><span>A mistake in a handler that stops the program (an index outside a list, say) stops the server too. That's why <code>Restart=always</code>.</span></div>
+      <div class="feature"><b>No streaming or WebSockets</b><span>Bodies up to 64 MB are read whole into memory, and answers are sent whole. There's no WebSocket server yet.</span></div>
+    </div>
   </div>
 </section>
 
 <section id="tested">
   <div class="wrap">
     <h2>Tested</h2>
-    <p class="intro"><code>tessel run tests</code> runs the router, requests and responses, the middleware, signing, files, templates, and a real server over TCP. The templates are compared with what Handlebars 4.7.8 gives, on cases written by hand and many made at random. Signing is checked with the RFC 4231 test values and values from Python's <code>hmac</code>.</p>
+    <p class="intro"><code>tessel run tests</code> runs the router, requests and responses, the middleware, signing, password hashes, CSRF, rate limits, proxies, session stores, files, templates, and a real server over TCP. They pass on macOS, and on Linux (ARM64 and x64) with Tessel's Linux release, where the library was also run behind Caddy over HTTPS. The templates are compared with what Handlebars 4.7.8 gives, on cases written by hand and many made at random.</p>
     <div class="stats">
-      <div class="stat"><b>3,316</b><span>checks, all passing</span></div>
+      <div class="stat"><b>3,403</b><span>checks, all passing on macOS and on Linux ARM64 and x64</span></div>
       <div class="stat"><b>3,076</b><span>templates that give what Handlebars 4.7.8 gives</span></div>
-      <div class="stat"><b>RFC 4231</b><span>and Python's <code>hmac</code> for the HMAC-SHA256 that signs sessions</span></div>
+      <div class="stat"><b>RFC 4231 · 7914</b><span>and Python's <code>hmac</code> and <code>hashlib</code> for HMAC-SHA256 and the PBKDF2 password hashes</span></div>
       <div class="stat"><b>~90,000</b><span>requests a second for a JSON API</span></div>
       <div class="stat"><b>~45,000</b><span>requests a second for a page from templates with a layout</span></div>
       <div class="stat"><b>~34,000</b><span>requests a second for a static stylesheet</span></div>
@@ -492,7 +577,8 @@ ok    other paths are not found  (8 ms)
       <tr><td><code>cookies()</code>, <code>cookie(name)</code></td><td>The cookies the browser sent.</td></tr>
       <tr><td><code>accepts(type)</code>, <code>contentType()</code></td><td>Whether the Accept header takes a type; the body's type without parameters.</td></tr>
       <tr><td><code>values</code>, <code>session</code></td><td>Notes left by middleware, and the session's values.</td></tr>
-      <tr><td><code>remote</code>, <code>received</code></td><td>The client's address, and when the request came.</td></tr>
+      <tr><td><code>ip</code>, <code>secure</code></td><td>The client's IP address, and whether it used HTTPS (behind a proxy, with <code>proxy()</code>).</td></tr>
+      <tr><td><code>remote</code>, <code>received</code></td><td>The connection's <code>"ip:port"</code>, and when the request came.</td></tr>
       <tr><td><code>web.readJson(r)</code></td><td>The body as JSON in your type, or <code>nil</code>.</td></tr>
     </table></div>
 
@@ -508,7 +594,7 @@ ok    other paths are not found  (8 ms)
       <tr><td><code>web.file(path, request, maxAge:, download:)</code></td><td>A file, with caching and ranges.</td></tr>
       <tr><td><code>web.page(templates, name, data, layout:)</code></td><td>A page from templates.</td></tr>
     </table></div>
-    <p class="intro" style="margin-top:14px">A <code>web.Response</code> (<code>status</code>, <code>headers</code>, <code>body</code>) changes with <code>withHeader</code>, <code>withStatus</code>, <code>withCookie(name, value, maxAge:, path:, domain:, httpOnly:, secure:, sameSite:)</code>, <code>withoutCookie</code> and <code>withSession</code>. Cookies are <code>HttpOnly</code> and <code>SameSite=Lax</code> unless you say otherwise.</p>
+    <p class="intro" style="margin-top:14px">A <code>web.Response</code> (<code>status</code>, <code>headers</code>, <code>body</code>) changes with <code>withHeader</code>, <code>withStatus</code>, <code>withCookie(name, value, maxAge:, path:, domain:, httpOnly:, secure:, sameSite:)</code>, <code>withoutCookie</code> and <code>withSession(values, renew:)</code>. Cookies are <code>HttpOnly</code> and <code>SameSite=Lax</code> unless you say otherwise.</p>
 
     <h3>Middleware</h3>
     <div class="table"><table>
@@ -516,13 +602,31 @@ ok    other paths are not found  (8 ms)
       <tr><td><code>logger()</code></td><td>Prints a line for each request: address, method, path, status, size and time.</td></tr>
       <tr><td><code>cors(origins:, methods:, headers:, credentials:, maxAge:)</code></td><td>Lets pages of other sites call the server, and answers preflight requests.</td></tr>
       <tr><td><code>basicAuth(realm:) { user, password in … }</code></td><td>Asks for a name and password; the name goes in <code>values["user"]</code>. Only over HTTPS.</td></tr>
-      <tr><td><code>sessions(secret:, cookie:, maxAge:, secure:, sameSite:)</code></td><td>Sessions in a signed cookie, two weeks from when last saved.</td></tr>
+      <tr><td><code>sessions(secret:, cookie:, maxAge:, secure:, sameSite:, store:)</code></td><td>Sessions in a signed cookie, or on the server with a <code>store</code> (the cookie then holds a signed random id). Two weeks from when last saved.</td></tr>
+      <tr><td><code>csrf(secret:, cookie:, field:, header:, secure:)</code></td><td>A token that forms must send back (field <code>_csrf</code> or header <code>X-CSRF-Token</code>), or a request with any method but GET, HEAD and OPTIONS gets a 403. Kept in the session once there is one (put <code>sessions</code> first), and in a <code>__Host-</code> cookie over HTTPS before that.</td></tr>
+      <tr><td><code>rateLimit(requests:, seconds:, key:, maxClients:)</code></td><td>A 429 with <code>Retry-After</code> for a client that asks too often; by IP address (an IPv6 address by its /64) unless <code>key:</code> says otherwise. Counts in memory.</td></tr>
+      <tr><td><code>proxy(trusted:)</code></td><td>The client's real address and HTTPS behind a proxy (<code>X-Forwarded-For</code>, <code>X-Forwarded-Proto</code>). Put it first.</td></tr>
       <tr><td><code>compress(minimum:)</code></td><td>gzip for text, HTML, CSS, JavaScript, JSON, XML and SVG, for clients that take it.</td></tr>
       <tr><td><code>securityHeaders(contentSecurityPolicy:)</code></td><td><code>nosniff</code>, no framing, a strict referrer policy, and a CSP if given.</td></tr>
       <tr><td><code>bodyLimit(bytes)</code></td><td>A 413 for bigger bodies.</td></tr>
       <tr><td><code>onRequest</code>, <code>onResponse</code>, <code>Middleware(before:, after:)</code></td><td>Middleware of your own.</td></tr>
     </table></div>
     <p class="intro" style="margin-top:14px"><code>web.sign</code>, <code>web.unsign</code> and <code>web.hmac</code> sign values of your own.</p>
+
+    <h3>Passwords, tokens and session stores</h3>
+    <div class="table"><table>
+      <tr><th>Function</th><th></th></tr>
+      <tr><td><code>web.hashPassword(password, iterations:)</code></td><td>A hash to keep instead of the password: PBKDF2-HMAC-SHA256, 600,000 rounds, a random salt, written the way Django writes it. About half a second, on purpose.</td></tr>
+      <tr><td><code>web.checkPassword(password, hash)</code></td><td>Whether a password fits a hash (Django's too).</td></tr>
+      <tr><td><code>web.hashPasswordLater(password) { hash in … }</code></td><td><code>hashPassword</code> on another thread, for handlers, so other requests go on.</td></tr>
+      <tr><td><code>web.checkPasswordLater(password, hash) { ok in … }</code></td><td><code>checkPassword</code> on another thread, for handlers.</td></tr>
+      <tr><td><code>web.tokens(secret:)</code></td><td>A source of secret tokens, made once at the start: <code>.token()</code> gives 43 random characters for a reset link or an API key. It reads 64 bytes from the system's secure random numbers a few milliseconds after it's made.</td></tr>
+      <tr><td><code>web.pbkdf2(password:, salt:, iterations:, length:)</code></td><td>PBKDF2-HMAC-SHA256 of <code>Data</code>, for keys of your own.</td></tr>
+      <tr><td><code>web.csrfField(r)</code>, <code>web.csrfToken(r)</code></td><td>A hidden form field with the CSRF token (<code>{{{csrf}}}</code> in a template), and the token itself for an <code>X-CSRF-Token</code> header.</td></tr>
+      <tr><td><code>web.memoryStore()</code></td><td>Sessions kept in memory; they end with the program.</td></tr>
+      <tr><td><code>web.databaseStore(path, table:)</code></td><td>Sessions kept in SQLite, so they last when the server restarts. It gives a <code>Result</code>: <code>try</code> it.</td></tr>
+    </table></div>
+    <p class="intro" style="margin-top:14px">A store is a struct of functions (<code>load</code>, <code>save</code>, <code>remove</code>, <code>removeWhere</code>, <code>count</code>), so a store for another database is a matter of filling them in. <code>sessions.removeWhere { s in s["user"] == "ann" }</code> signs Ann out everywhere.</p>
 
     <h3>Template tags</h3>
     <div class="table"><table>

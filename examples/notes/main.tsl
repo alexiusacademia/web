@@ -78,7 +78,7 @@ fn main() {
         let hash = users[name] ?? "none"
         web.checkPasswordLater(form["password"] ?? "", hash) { ok in
             if ok {
-                reply(web.redirect("/", status: 303).withSession(["user": name]))
+                reply(web.redirect("/", status: 303).withSession(["user": name], renew: true))
             } else {
                 reply(web.redirect("/?error=Wrong+name+or+password", status: 303))
             }

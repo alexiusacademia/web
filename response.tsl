@@ -15,6 +15,9 @@ public struct Response {
     // The session to save, when the `sessions` middleware is used: nil
     // keeps the request's session as it was.
     session: [String: String]? = nil
+    // With `session`: whether the session gets a new id (and a new CSRF
+    // token), as it should when someone signs in.
+    renew: Bool = false
 
     // A header's value, by its name in any case.
     fn header(_ name: String) -> String? {
@@ -92,10 +95,13 @@ public struct Response {
     }
 
     // The same answer, saving `values` as the session (with the `sessions`
-    // middleware). An empty dictionary ends the session.
-    fn withSession(_ values: [String: String]) -> Response {
+    // middleware). An empty dictionary ends the session. `renew` gives
+    // the session a new id: do it when someone signs in, so an id anyone
+    // saw before is worthless.
+    fn withSession(_ values: [String: String], renew: Bool = false) -> Response {
         var copy = self
         copy.session = values
+        copy.renew = renew
         copy
     }
 

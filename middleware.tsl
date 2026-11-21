@@ -209,8 +209,10 @@ public fn bodyLimit(_ bytes: Int) -> Middleware {
 //
 // With a `store` (`web.memoryStore()`, `web.databaseStore(…)`), the
 // values stay on the server and the cookie holds only a signed random
-// id, which changes each time the session is saved. Sessions can then
+// id. Sessions can then
 // be ended from the server: `store.removeWhere { s in s["user"] == "ann" }`.
+// The id stays the same as the session is saved, and changes with
+// `withSession(…, renew: true)`, which signing in should use.
 //
 // `secret` should be long and random, and kept out of the code; changing
 // it ends every session. `maxAge` is in seconds.
@@ -223,6 +225,7 @@ public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 120
     // A key of its own, so a value signed with `web.sign` and the same
     // secret is never a session.
     let key = hmac(key: Data(text: secret), message: Data(text: "web sessions")).hex
+    let source = tokens(secret: key)
     Middleware(before: { request in
         var passed = request
         if let raw = request.cookie(cookie) {
@@ -251,11 +254,32 @@ public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 120
         if let values = response.session {
             var r = response
             r.session = nil
+            r.renew = false
             let oldId = request.values["web.session.id"] ?? ""
             if let s = store {
-                if !oldId.isEmpty {
-                    s.remove(oldId)
+                // Ended on the server while this request was on its way
+                // (signed out, or by removeWhere): it stays ended.
+                if !oldId.isEmpty && s.load(oldId) == nil {
+                    return r
                 }
+                if values.isEmpty {
+                    if !oldId.isEmpty {
+                        s.remove(oldId)
+                    }
+                    if request.cookie(cookie) == nil {
+                        return r
+                    }
+                    return r.withoutCookie(cookie)
+                }
+                var id = oldId
+                if id.isEmpty || response.renew {
+                    if !id.isEmpty {
+                        s.remove(id)
+                    }
+                    id = source.token()
+                }
+                s.save(id, StoredSession(values: values, expires: now() + Float(maxAge)))
+                return r.withCookie(cookie, sign(id, secret: key), maxAge: maxAge, secure: secure, sameSite: sameSite)
             }
             if values.isEmpty {
                 if request.cookie(cookie) == nil {
@@ -263,16 +287,7 @@ public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 120
                 }
                 return r.withoutCookie(cookie)
             }
-            let expires = now() + Float(maxAge)
-            var payload = ""
-            if let s = store {
-                // A new id each time, so an id known before signing in is
-                // worth nothing after.
-                payload = randomToken(secret: key)
-                s.save(payload, StoredSession(values: values, expires: expires))
-            } else {
-                payload = toBase64Url(Data(text: toJson(StoredSession(values: values, expires: expires))).base64)
-            }
+            let payload = toBase64Url(Data(text: toJson(StoredSession(values: values, expires: now() + Float(maxAge)))).base64)
             return r.withCookie(cookie, sign(payload, secret: key), maxAge: maxAge, secure: secure, sameSite: sameSite)
         }
         response

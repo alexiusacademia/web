@@ -7,34 +7,95 @@
 
 // ---- Random tokens ----
 
-// `count` random bytes for secrets. On macOS, Linux and Android they come
-// from the system (/dev/urandom). Tessel has no such source on Windows
-// yet (tessel#84), so there they're HMAC-SHA256, keyed with `secret`,
-// over the time and Tessel's `random`: as good as `secret` is long and
-// random.
-fn secureBytes(_ count: Int, _ secret: String) -> Data {
-    if platform() != "windows" {
-        if let bytes = readData("/dev/urandom", from: 0, count: count) {
-            if bytes.count == count {
-                return bytes
-            }
-        }
+// A source of secret random bytes and tokens (`web.tokens()`).
+public struct Tokens {
+    take: fn(Int) -> Data
+    seeded: fn() -> Bool
+
+    // `count` random bytes.
+    fn bytes(_ count: Int) -> Data {
+        take(count)
     }
-    var out = Data()
-    var block = 0
-    while out.count < count {
-        let seed = "{now()}:{block}:{random(0..2147483647)}:{random(0..2147483647)}:{randomFloat()}"
-        out += hmac(key: Data(text: secret + ":web random"), message: Data(text: seed))
-        block += 1
+
+    // `bytes` random bytes as URL-safe base64: 32 bytes give 43
+    // characters, for a secret link, a key or an id.
+    fn token(bytes: Int = 32) -> String {
+        toBase64Url(take(bytes).base64)
     }
-    out.slice(from: 0, to: count)
+
+    // Whether the system's random bytes have arrived (see `tokens`).
+    fn isSeeded() -> Bool {
+        seeded()
+    }
 }
 
-// A random token for a secret link, a key or an id: `bytes` random bytes
-// as URL-safe base64 (32 bytes give 43 characters). On Windows, pass a
-// long random `secret` of your own (see `secureBytes`).
-public fn randomToken(bytes: Int = 32, secret: String = "") -> String {
-    toBase64Url(secureBytes(bytes, secret).base64)
+// A source of secret tokens. Tessel 0.23 has no way to read the system's
+// secure random numbers directly (tessel#84), so this reads 64 bytes from
+// it once, with `od` and /dev/urandom on macOS, Linux and Android and
+// .NET's RandomNumberGenerator through PowerShell on Windows, a few
+// milliseconds after it's made, while the program runs. Each token is
+// then HMAC-SHA256 of a counter, keyed with those bytes and `secret`.
+// Tokens asked for before the bytes arrive (or if they can't be read,
+// which is reported on the error output) are keyed with `secret` alone,
+// with the time and Tessel's `random`: give a long random `secret` and
+// make the source when the program starts.
+public fn tokens(secret: String = "") -> Tokens {
+    var seed = Data()
+    var ready = false
+    var counter = 0
+    var output = ""
+    let windows = platform() == "windows"
+    let path = if windows { "powershell" } else { "od" }
+    let args = if windows {
+        ["-NoProfile", "-NonInteractive", "-Command",
+         "[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(64))"]
+    } else {
+        ["-An", "-N64", "-tx1", "-v", "/dev/urandom"]
+    }
+    runCommand(path: path, args: args, onOutput: { line in
+        output += line.trim()
+    }) { code in
+        if code == 0 {
+            let bytes = if windows { decodeBase64(output) ?? Data() } else { hexBytes(output.replace(" ", with: "")) }
+            if bytes.count == 64 {
+                seed = bytes
+                ready = true
+            }
+        }
+        if !ready {
+            printError("web: can't read random bytes from the system ({path} gave {code}); tokens rest on the secret alone")
+        }
+    }
+    Tokens(take: { count in
+        var out = Data()
+        while out.count < count {
+            counter += 1
+            if ready {
+                out += hmac(key: seed + Data(text: secret), message: Data(text: "web token {counter}"))
+            } else {
+                let mixed = "{counter}:{now()}:{random(0..2147483647)}:{random(0..2147483647)}:{randomFloat()}"
+                out += hmac(key: Data(text: secret + ":web tokens"), message: Data(text: mixed))
+            }
+        }
+        out.slice(from: 0, to: count)
+    }, seeded: { ready })
+}
+
+// Bytes from hexadecimal digits ("0aff"), or fewer if a digit is wrong.
+fn hexBytes(_ hex: String) -> Data {
+    let chars = hex.characters
+    var out = Data()
+    var i = 0
+    while i + 1 < chars.count {
+        let hi = hexDigit(chars[i])
+        let lo = hexDigit(chars[i + 1])
+        if hi < 0 || lo < 0 {
+            return out
+        }
+        out.append(byte: hi * 16 + lo)
+        i += 2
+    }
+    out
 }
 
 // ---- Passwords ----
@@ -73,14 +134,21 @@ public fn pbkdf2(password: Data, salt: Data, iterations: Int, length: Int = 32) 
     out.slice(from: 0, to: length)
 }
 
+// The most rounds a password hash may ask for (about 7 seconds).
+let maxIterations = 10000000
+
 // A password's hash to store, in Django's form:
-// "pbkdf2_sha256$600000$salt$hash". The salt is new each time, so the
-// same password gives a different hash. 600,000 rounds take about half a
-// second; on a busy server, use `hashPasswordLater`.
+// "pbkdf2_sha256$600000$salt$hash" (rounds from 1 to 10,000,000). The
+// salt is new each time, so the same password gives a different hash.
+// 600,000 rounds take about half a second; on a busy server, use
+// `hashPasswordLater`.
 public fn hashPassword(_ password: String, iterations: Int = 600000) -> String {
-    let salt = randomToken(bytes: 16).replace("-", with: "a").replace("_", with: "b").substring(from: 0, to: 22)
-    let derived = pbkdf2(password: Data(text: password), salt: Data(text: salt), iterations: iterations)
-    "pbkdf2_sha256${iterations}${salt}${derived.base64}"
+    // A salt only has to be different for each hash, not secret.
+    let mixed = Data(text: "{now()}:{random(0..2147483647)}:{random(0..2147483647)}:{randomFloat()}:{password.count}")
+    let salt = toBase64Url(mixed.hash().base64).replace("-", with: "a").replace("_", with: "b").substring(from: 0, to: 22)
+    let rounds = min(max(iterations, 1), maxIterations)
+    let derived = pbkdf2(password: Data(text: password), salt: Data(text: salt), iterations: rounds)
+    "pbkdf2_sha256${rounds}${salt}${derived.base64}"
 }
 
 // Whether `password` is the one `hash` was made from (by `hashPassword`,
@@ -91,7 +159,7 @@ public fn checkPassword(_ password: String, _ hash: String) -> Bool {
         return false
     }
     if let iterations = Int(parts[1]) {
-        if iterations < 1 || iterations > 100000000 {
+        if iterations < 1 || iterations > maxIterations {
             return false
         }
         let derived = pbkdf2(password: Data(text: password), salt: Data(text: parts[2]), iterations: iterations)
@@ -117,47 +185,71 @@ public fn checkPasswordLater(_ password: String, _ hash: String, done: fn(Bool))
 
 // ---- CSRF ----
 
-// Stops other sites from sending forms in a signed-in user's name. Each
-// browser gets a token in a signed cookie; a POST, PUT, PATCH or DELETE
-// must send it back, as the form field `field` or the header `header`,
-// or it gets a 403. Put `web.csrfField(r)` in each form (or send
-// `web.csrfToken(r)` in the header from JavaScript). Use it on the
-// routes of pages and forms, not on an API that other programs call.
-public fn csrf(secret: String, cookie: String = "csrf", field: String = "_csrf", header: String = "x-csrf-token",
+// Stops other sites from sending forms in a signed-in user's name. A
+// request with any method but GET, HEAD and OPTIONS must send the CSRF
+// token back, as the form field `field` or the header `header`, or it
+// gets a 403. Put `web.csrfField(r)` in each form (or send
+// `web.csrfToken(r)` in the header from JavaScript).
+//
+// Where the token is kept: in the session once there is one (use the
+// `sessions` middleware before this one), so it belongs to that session
+// and a new one comes with `withSession(…, renew: true)` at sign-in;
+// before that, in a signed cookie, named `__Host-csrf` over HTTPS (with
+// `secure`, or `request.secure` behind `proxy()`) so other sites on the
+// same domain can't set it, and `csrf` otherwise.
+//
+// Use it on the routes of pages and forms, not on an API that other
+// programs call.
+public fn csrf(secret: String, cookie: String = "", field: String = "_csrf", header: String = "x-csrf-token",
                secure: Bool = false) -> Middleware {
     if secret.count < 16 {
         print("web: a CSRF secret must be at least 16 characters")
         exit(1)
     }
     let key = hmac(key: Data(text: secret), message: Data(text: "web csrf")).hex
+    let source = tokens(secret: key)
+    let cookieName: fn(Request) -> String = { r in
+        if !cookie.isEmpty { cookie } else if secure || r.secure { "__Host-csrf" } else { "csrf" }
+    }
     Middleware(before: { request in
         var passed = request
-        var token = ""
-        var known = false
-        if let raw = request.cookie(cookie) {
-            if let t = unsign(raw, secret: key) {
-                token = t
-                known = true
-            }
+        let inSession = request.session["_csrf"] ?? ""
+        var inCookie = ""
+        if let raw = request.cookie(cookieName(request)) {
+            inCookie = unsign(raw, secret: key) ?? ""
         }
-        if !known {
-            token = randomToken(secret: key)
+        var token = if inSession.isEmpty { inCookie } else { inSession }
+        if token.isEmpty {
+            token = source.token()
             passed.values["web.csrf.new"] = "1"
         }
         passed.values["csrf"] = token
         let m = request.method
-        if m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE" {
+        if m != "GET" && m != "HEAD" && m != "OPTIONS" {
+            let expected = if inSession.isEmpty { inCookie } else { inSession }
             let sent = request.header(header) ?? (request.form()[field] ?? "")
-            if !known || sent.isEmpty || !sameText(sent, token) {
+            if expected.isEmpty || sent.isEmpty || !sameText(sent, expected) {
                 return Step.stop(response: status(403, "The form is out of date or came from another site: reload the page and try again"))
             }
         }
         Step.next(request: passed)
     }, after: { request, response in
-        if request.values["web.csrf.new"] == "1" {
-            return response.withCookie(cookie, sign(request.values["csrf"] ?? "", secret: key), secure: secure)
+        var r = response
+        let token = request.values["csrf"] ?? ""
+        // A session being saved keeps its token (a new one at sign-in).
+        if let values = response.session {
+            if !values.isEmpty && (response.renew || values["_csrf"] == nil) {
+                var kept = values
+                kept["_csrf"] = if response.renew { source.token() } else { token }
+                r.session = kept
+            }
+            return r
         }
-        response
+        if request.values["web.csrf.new"] == "1" && request.session.isEmpty {
+            let isSecure = secure || request.secure
+            return r.withCookie(cookieName(request), sign(token, secret: key), secure: isSecure)
+        }
+        r
     })
 }
 
@@ -182,23 +274,28 @@ struct RateWindow {
 
 // Lets each client make at most `requests` requests every `seconds`;
 // more get a 429 with Retry-After. Clients are told apart by `key`: their
-// IP address unless you say otherwise (a user's name, an API key).
+// IP address unless you say otherwise (a user's name, an API key); an
+// IPv6 address counts by its first half (its /64 network), since one
+// client usually has a whole /64.
 // Answers carry RateLimit-Limit, RateLimit-Remaining and RateLimit-Reset.
 // The counts are kept in memory, for this server only.
-public fn rateLimit(requests: Int, seconds: Float, key: fn(Request) -> String = clientIP) -> Middleware {
+public fn rateLimit(requests: Int, seconds: Float, key: fn(Request) -> String = clientIP,
+                    maxClients: Int = 100000) -> Middleware {
     var windows: [String: RateWindow] = [:]
     var lastSweep = now()
     Middleware(before: { request in
         let t = now()
-        // Forget clients whose window has ended, now and then.
-        if t - lastSweep > max(seconds, 60.0) {
+        // Forget clients whose window has ended, now and then, and when
+        // there are too many (then, if they're all still counting, start
+        // again rather than run out of memory).
+        if t - lastSweep > max(seconds, 60.0) || windows.count > maxClients {
             var kept: [String: RateWindow] = [:]
             for (k, w) in windows {
                 if t - w.start < seconds {
                     kept[k] = w
                 }
             }
-            windows = kept
+            windows = if kept.count > maxClients { [:] } else { kept }
             lastSweep = t
         }
         let k = key(request)
@@ -230,9 +327,41 @@ public fn rateLimit(requests: Int, seconds: Float, key: fn(Request) -> String = 
     })
 }
 
-// The client's IP address: the default key for `rateLimit`.
+// The client's IP address, or its /64 network for IPv6: the default key
+// for `rateLimit`.
 fn clientIP(_ request: Request) -> String {
-    request.ip
+    ipNetwork(request.ip)
+}
+
+// An IPv4 address as it is; an IPv6 address as its first four groups.
+fn ipNetwork(_ ip: String) -> String {
+    if !ip.contains(":") {
+        return ip
+    }
+    var groups: [String] = []
+    if let gap = ip.find("::") {
+        let left = ip.substring(from: 0, to: gap).split(":").filter { g in !g.isEmpty }
+        let right = ip.substring(from: gap + 2, to: ip.count).split(":").filter { g in !g.isEmpty }
+        groups = left
+        var fill = 8 - left.count - right.count
+        while fill > 0 {
+            groups.append("0")
+            fill -= 1
+        }
+        groups += right
+    } else {
+        groups = ip.split(":")
+    }
+    var first: [String] = []
+    for g in groups.slice(from: 0, to: 4) {
+        let trimmed = g.lowercase().trimStart()
+        var t = trimmed
+        while t.count > 1 && t.hasPrefix("0") {
+            t = t.substring(from: 1, to: t.count)
+        }
+        first.append(t)
+    }
+    first.joined(separator: ":") + "::/64"
 }
 
 // ---- Proxies ----
@@ -271,9 +400,17 @@ public fn proxy(trusted: [String] = ["127.0.0.1", "::1"]) -> Middleware {
 }
 
 // An address without its port: "1.2.3.4:80" is "1.2.3.4", "[::1]:80" is
-// "::1"; a bare IPv6 address stays as it is.
+// "::1"; a bare IPv6 address stays as it is, and an IPv4 address written
+// as IPv6 ("::ffff:1.2.3.4") is the IPv4 address.
 fn hostOnly(_ address: String) -> String {
-    let a = address.trim()
+    let a = withoutPort(address.trim())
+    if a.lowercase().hasPrefix("::ffff:") && a.contains(".") {
+        return a.substring(from: 7, to: a.count)
+    }
+    a
+}
+
+fn withoutPort(_ a: String) -> String {
     if a.hasPrefix("[") {
         if let close = a.find("]") {
             return a.substring(from: 1, to: close)

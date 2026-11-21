@@ -526,11 +526,17 @@ fn security(_ t: Tally) -> Tally {
     t2.check("600,000 rounds", full.hasPrefix("pbkdf2_sha256$600000$") && web.checkPassword("s3cret", full))
     print("(two 600,000-round hashes took {(now() - started).formatted(decimals: 2)} s)")
 
-    let a = web.randomToken()
+    let source = web.tokens(secret: "tests")
+    let a = source.token()
     t2.number("token length", a.count, 43)
-    t2.check("tokens differ", a != web.randomToken())
+    t2.check("tokens differ", a != source.token())
     t2.check("token is URL-safe", !a.contains("+") && !a.contains("/") && !a.contains("="))
-    t2.number("short token", web.randomToken(bytes: 3).count, 4)
+    t2.number("short token", source.token(bytes: 3).count, 4)
+    t2.number("bytes", source.bytes(70).count, 70)
+    t2.check("not seeded at once", !source.isSeeded())
+    let zero = web.hashPassword("z", iterations: 0)
+    t2.check("at least one round", zero.hasPrefix("pbkdf2_sha256$1$") && web.checkPassword("z", zero))
+    t2.check("too many rounds refused", !web.checkPassword("z", "pbkdf2_sha256$10000001$abc$xyz"))
 
     // CSRF.
     var forms = web.Router()
@@ -552,11 +558,56 @@ fn security(_ t: Tally) -> Tally {
     t2.number("csrf forged cookie", ask(forms, "POST", "/save", body: "_csrf=abc",
                                         headers: ["Content-Type": "application/x-www-form-urlencoded", "Cookie": "csrf=abc.def"]).status, 403)
     t2.number("csrf kept", ask(forms, "GET", "/form", headers: ["Cookie": "csrf={cookie}"]).cookies.count, 0)
+    forms.any("/dav") { r in web.text("dav") }
+    t2.number("csrf other methods", ask(forms, "PROPFIND", "/dav", headers: ["Cookie": "csrf={cookie}"]).status, 403)
+    t2.number("csrf HEAD", ask(forms, "HEAD", "/dav").status, 200)
+    t2.number("csrf OPTIONS", ask(forms, "OPTIONS", "/dav").status, 200)
+    var secureForms = web.Router()
+    secureForms.use(web.csrf(secret: "a csrf secret, sixteen or more", secure: true))
+    secureForms.get("/") { r in web.text("x") }
+    let hostCookie = ask(secureForms, "GET", "/").cookies
+    t2.check("__Host- cookie", hostCookie.count == 1 && hostCookie[0].hasPrefix("__Host-csrf=") && hostCookie[0].contains("; Path=/;") &&
+             hostCookie[0].contains("; Secure"))
+
+    // With sessions, the token lives in the session, and changes at sign-in.
+    let store = web.memoryStore()
+    var bound = web.Router()
+    bound.use(web.sessions(secret: "a secret of at least sixteen characters", store: store))
+    bound.use(web.csrf(secret: "a csrf secret, sixteen or more"))
+    bound.get("/") { r in web.text(web.csrfToken(r)) }
+    bound.post("/login") { r in web.text("in").withSession(["user": "ann"], renew: true) }
+    bound.post("/save") { r in web.text("saved {r.session["user"] ?? ""}") }
+    let anon = ask(bound, "GET", "/")
+    let anonCookie = if anon.cookies.isEmpty { "" } else { anon.cookies[0].substring(from: 5, to: anon.cookies[0].find(";") ?? 5) }
+    t2.number("anonymous: no session made", store.count(), 0)
+    let signedIn = ask(bound, "POST", "/login", headers: ["Cookie": "csrf={anonCookie}", "X-CSRF-Token": anon.text()])
+    let sessionCookie = if signedIn.cookies.isEmpty { "" } else { signedIn.cookies[0].substring(from: 8, to: signedIn.cookies[0].find(";") ?? 8) }
+    t2.check("signed in", signedIn.text() == "in" && !sessionCookie.isEmpty)
+    let both = "session={sessionCookie}; csrf={anonCookie}"
+    let sessionToken = ask(bound, "GET", "/", headers: ["Cookie": both]).text()
+    t2.check("new token at sign-in", !sessionToken.isEmpty && sessionToken != anon.text())
+    t2.number("old token refused", ask(bound, "POST", "/save", headers: ["Cookie": both, "X-CSRF-Token": anon.text()]).status, 403)
+    t2.same("session token works", ask(bound, "POST", "/save", headers: ["Cookie": both, "X-CSRF-Token": sessionToken]).text(), "saved ann")
 
     // Rate limits.
     var limited = web.Router()
     limited.use(web.rateLimit(requests: 3, seconds: 60))
     limited.get("/") { r in web.text("ok") }
+    var v6 = web.Router()
+    v6.use(web.rateLimit(requests: 1, seconds: 60))
+    v6.get("/") { r in web.text("ok") }
+    var sixStatus: [Int] = []
+    for address in ["[2001:db8::1]:1", "[2001:0DB8:0:0:ffff::2]:1", "[2001:db8:0:1::1]:1"] {
+        v6.handle(web.Request(path: "/", remote: address)) { res in sixStatus.append(res.status) }
+    }
+    t2.same("one limit per /64", toJson(sixStatus), "[200,429,200]")
+    var capped = web.Router()
+    capped.use(web.rateLimit(requests: 1, seconds: 60, maxClients: 5))
+    capped.get("/") { r in web.text("ok") }
+    for i in 0..20 {
+        capped.handle(web.Request(path: "/", remote: "10.0.0.{i}:1")) { res in sixStatus.append(res.status) }
+    }
+    t2.number("many clients", sixStatus.count, 23)
     let first = ask(limited, "GET", "/")
     t2.same("limit headers", "{first.header("ratelimit-limit") ?? ""} {first.header("ratelimit-remaining") ?? ""}", "3 2")
     let middle = [ask(limited, "GET", "/").status, ask(limited, "GET", "/").status]
@@ -594,6 +645,8 @@ fn security(_ t: Tally) -> Tally {
     plain.get("/") { r in web.text(r.ip) }
     plain.handle(six) { res in seen = res.text() }
     t2.same("ipv6 remote", seen, "::1")
+    plain.handle(web.Request(path: "/", remote: "[::ffff:127.0.0.1]:80")) { res in seen = res.text() }
+    t2.same("mapped ipv4", seen, "127.0.0.1")
     t2
 }
 
@@ -610,26 +663,53 @@ fn stores(_ t: Tally) -> Tally {
     }
     router.get("/") { r in web.text("user={r.session["user"] ?? "none"}") }
     router.post("/logout") { r in web.text("out").withSession([:]) }
+    router.post("/renew") { r in web.text("renewed").withSession(r.session, renew: true) }
     let login = ask(router, "POST", "/login?user=ann")
     let c1 = if login.cookies.isEmpty { "" } else { login.cookies[0].substring(from: 8, to: login.cookies[0].find(";") ?? 8) }
     t2.check("store cookie holds an id", c1.count < 120 && !c1.contains("ann"))
     t2.number("one session", store.count(), 1)
     t2.same("store read", ask(router, "GET", "/", headers: ["Cookie": "session={c1}"]).text(), "user=ann")
     let touched = ask(router, "POST", "/touch", headers: ["Cookie": "session={c1}"])
-    let c2 = if touched.cookies.isEmpty { "" } else { touched.cookies[0].substring(from: 8, to: touched.cookies[0].find(";") ?? 8) }
-    t2.check("new id on save", !c2.isEmpty && c2 != c1)
+    let same = if touched.cookies.isEmpty { "" } else { touched.cookies[0].substring(from: 8, to: touched.cookies[0].find(";") ?? 8) }
+    t2.same("same id on save", same, c1)
+    t2.same("a parallel request still works", ask(router, "GET", "/", headers: ["Cookie": "session={c1}"]).text(), "user=ann")
+    let renewed = ask(router, "POST", "/renew", headers: ["Cookie": "session={c1}"])
+    let c2 = if renewed.cookies.isEmpty { "" } else { renewed.cookies[0].substring(from: 8, to: renewed.cookies[0].find(";") ?? 8) }
+    t2.check("new id on renew", !c2.isEmpty && c2 != c1)
     t2.same("old id ended", ask(router, "GET", "/", headers: ["Cookie": "session={c1}"]).text(), "user=none")
     t2.same("new id works", ask(router, "GET", "/", headers: ["Cookie": "session={c2}"]).text(), "user=ann")
     t2.number("still one session", store.count(), 1)
+    // A slow request that started before sign-out can't bring the session back.
+    var slowReply: fn(web.Response)? = nil
+    router.later("POST", "/slow") { r, reply in
+        slowReply = { res in reply(res.withSession(r.session)) }
+    }
+    var slowAnswer = web.Response()
+    router.handle(web.Request(method: "POST", path: "/slow", headers: ["cookie": "session={c2}"])) { res in slowAnswer = res }
+    t2.same("signed out", ask(router, "POST", "/logout", headers: ["Cookie": "session={c2}"]).text(), "out")
+    if let finish = slowReply {
+        finish(web.text("late"))
+    }
+    t2.check("ended stays ended", slowAnswer.cookies.isEmpty && store.count() == 0)
+    t2.same("still signed out", ask(router, "GET", "/", headers: ["Cookie": "session={c2}"]).text(), "user=none")
+    let again = ask(router, "POST", "/login?user=ann")
+    let c2b = if again.cookies.isEmpty { "" } else { again.cookies[0].substring(from: 8, to: again.cookies[0].find(";") ?? 8) }
+    t2.same("signed in again", ask(router, "GET", "/", headers: ["Cookie": "session={c2b}"]).text(), "user=ann")
     let bob = ask(router, "POST", "/login?user=bob")
     let c3 = if bob.cookies.isEmpty { "" } else { bob.cookies[0].substring(from: 8, to: bob.cookies[0].find(";") ?? 8) }
     t2.number("ended by the server", store.removeWhere({ s in s["user"] == "ann" }), 1)
-    t2.same("ann signed out", ask(router, "GET", "/", headers: ["Cookie": "session={c2}"]).text(), "user=none")
+    t2.same("ann signed out", ask(router, "GET", "/", headers: ["Cookie": "session={c2b}"]).text(), "user=none")
     t2.same("bob still in", ask(router, "GET", "/", headers: ["Cookie": "session={c3}"]).text(), "user=bob")
     let out = ask(router, "POST", "/logout", headers: ["Cookie": "session={c3}"])
     t2.check("logout clears", out.cookies.count == 1 && out.cookies[0].hasPrefix("session=; Max-Age=0"))
     t2.number("no sessions", store.count(), 0)
     t2.same("unsigned id refused", ask(router, "GET", "/", headers: ["Cookie": "session={c3.substring(from: 0, to: c3.findLast(".") ?? 0)}"]).text(), "user=none")
+
+    let small = web.memoryStore(limit: 10)
+    for i in 0..25 {
+        small.save("id{i}", web.StoredSession(values: ["n": "{i}"], expires: now() + Float(100 + i)))
+    }
+    t2.check("store limit", small.count() <= 10 && small.load("id24") != nil && small.load("id0") == nil)
 
     // In a database: a second store on the same file finds the session.
     let path = "tests/sessions-test.db"
@@ -854,10 +934,17 @@ fn main() {
                     t.number("served range", part.status, 206)
                     t.number("served range bytes", part.data.count, 3)
                     stopHTTP(server)
+                    let seededSource = web.tokens(secret: "tests")
+                    after(seconds: 0.5) {
+                        t.check("seeded from the system", seededSource.isSeeded())
+                        t.check("seeded tokens differ", seededSource.token() != seededSource.token())
+                    }
                     web.hashPasswordLater("later", iterations: 2000) { hash in
                         web.checkPasswordLater("later", hash) { ok in
                             t.check("passwords on another thread", ok && hash.hasPrefix("pbkdf2_sha256$2000$"))
-                            finish(t)
+                            after(seconds: 0.7) {
+                                finish(t)
+                            }
                         }
                     }
                 }
