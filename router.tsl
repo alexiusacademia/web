@@ -337,19 +337,34 @@ fn defaultNotFound(_ request: Request) -> Response {
 // can't listen. `host: "0.0.0.0"` lets other computers reach it.
 public fn serve(_ router: Router, port: Int, host: String = "127.0.0.1") -> Int {
     serveHTTP(port: port, host: host) { r in
-        let request = Request(id: r.id, method: r.method, path: r.path, query: r.query,
-                              headers: r.headers, body: r.body, remote: r.remote, received: now())
-        let keepAlive = (request.header("connection") ?? "").lowercase().contains("keep-alive")
-        router.handle(request) { response in
-            var headers = wireHeaders(response)
-            // Tessel's server keeps an HTTP/1.0 client's connection open
-            // when it asks to, but doesn't say so; such clients wait for
-            // the connection to close unless the answer says it stays.
-            if keepAlive && response.header("connection") == nil {
-                headers["Connection"] = "keep-alive"
-            }
-            respondHTTP(r.id, status: response.status, headers: headers, body: response.body)
-        }
+        answer(router, r)
+    }
+}
+
+// Serves on `workers` threads at once: each worker makes its own router
+// with `routes`, a top-level function (`fn routes() -> web.Router`), and
+// requests go to whichever is free. Threads share no variables: data that
+// every request should see goes in a `Shared` value or a database (the
+// `memoryStore` and `rateLimit` keep theirs in `Shared` values already).
+// A runtime error in a handler stops only its worker: the request gets a
+// 500, and a new worker takes its place.
+public fn serveWorkers(_ routes: fn() -> Router, port: Int, host: String = "127.0.0.1", workers: Int = 4) -> Int {
+    serveHTTP(port: port, host: host, workers: workers, start: { workerBlock(routes) })
+}
+
+// A worker's block for requests: its router, made on its thread.
+fn workerBlock(_ routes: fn() -> Router) -> fn(ServerRequest) {
+    let router = routes()
+    { r in
+        answer(router, r)
+    }
+}
+
+fn answer(_ router: Router, _ r: ServerRequest) {
+    let request = Request(id: r.id, method: r.method, path: r.path, query: r.query,
+                          headers: r.headers, body: r.body, remote: r.remote, received: now())
+    router.handle(request) { response in
+        sendAnswer(r.id, response)
     }
 }
 

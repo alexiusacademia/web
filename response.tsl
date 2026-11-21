@@ -15,6 +15,11 @@ public struct Response {
     // The session to save, when the `sessions` middleware is used: nil
     // keeps the request's session as it was.
     session: [String: String]? = nil
+    // An answer sent in pieces (`web.stream`, `web.events`): what writes
+    // them, after the status and headers are sent.
+    stream: fn(Stream)? = nil
+    // A WebSocket's blocks (`web.webSocket`).
+    socket: SocketBlocks? = nil
     // With `session`: whether the session gets a new id (and a new CSRF
     // token), as it should when someone signs in.
     renew: Bool = false
@@ -229,34 +234,145 @@ fn cookieValue(_ value: String) -> String {
     value.urlEncoded
 }
 
-// The headers to send: the answer's, plus one Set-Cookie for each cookie.
-// HTTP names are the same in any case and Tessel's server sends one line
-// for each name, so each cookie line goes under its own spelling of
-// Set-Cookie (Set-Cookie, set-Cookie, Set-cookie, …).
+// The headers to send: the answer's, plus a Set-Cookie with a line for
+// each cookie (Tessel sends each line as a header of its own).
 fn wireHeaders(_ response: Response) -> [String: String] {
     var out = withoutHeader(response.headers, "set-cookie")
-    var i = 0
-    for line in response.cookies {
-        out[cookieHeaderName(i)] = line
-        i += 1
+    if !response.cookies.isEmpty {
+        out["Set-Cookie"] = response.cookies.joined(separator: "\n")
     }
     out
 }
 
-// The i-th spelling of Set-Cookie: each bit of i lowers or raises one
-// letter. There are 2^9 of them.
-fn cookieHeaderName(_ i: Int) -> String {
-    let letters = "SetCookie".characters
-    let base = ["s", "e", "t", "c", "o", "o", "k", "i", "e"]
-    var name = ""
-    var k = 0
-    for letter in letters {
-        let lower = (i >> k) & 1 == 1
-        name += if lower { if letter == base[k] { letter.uppercase() } else { base[k] } } else { letter }
-        if k == 2 {
-            name += "-"
-        }
-        k += 1
+// ---- Answers in pieces ----
+
+// Where an answer sent in pieces goes: `web.stream { out in … }`.
+public struct Stream {
+    // The request it answers.
+    request: Int
+
+    // Sends text. False once the client has gone.
+    fn send(_ text: String) -> Bool {
+        sendHTTP(request, data: Data(text: text))
     }
-    name
+
+    // Sends bytes. False once the client has gone.
+    fn sendData(_ data: Data) -> Bool {
+        sendHTTP(request, data: data)
+    }
+
+    // Sends a server-sent event (with `web.events`): `data` (each of its
+    // lines), with an event name and an id if given.
+    fn event(_ data: String, name: String = "", id: String = "") -> Bool {
+        var text = ""
+        if !name.isEmpty {
+            text += "event: {name}\n"
+        }
+        if !id.isEmpty {
+            text += "id: {id}\n"
+        }
+        for line in data.split("\n") {
+            text += "data: {line}\n"
+        }
+        send(text + "\n")
+    }
+
+    // Bytes sent but not yet taken by the client: wait while it grows.
+    fn queued() -> Int {
+        httpQueued(request)
+    }
+
+    // Ends the answer.
+    fn end() {
+        endHTTP(request)
+    }
+}
+
+// An answer sent in pieces: `write` gets a `Stream` once the status and
+// headers are out, sends what it likes (now or from later blocks), and
+// ends it with `end()`. Without a Content-Length it goes in chunks.
+public fn stream(type: String = "text/plain; charset=utf-8", status: Int = 200, _ write: fn(Stream)) -> Response {
+    Response(status: status, headers: ["Content-Type": type], stream: write)
+}
+
+// Server-sent events, which a page reads with `new EventSource(url)`:
+// `out.event("…")` sends one.
+public fn events(_ write: fn(Stream)) -> Response {
+    Response(headers: ["Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"],
+             stream: write)
+}
+
+// ---- WebSockets ----
+
+// A WebSocket a route accepted.
+public struct WebSocket {
+    id: Int
+
+    // Sends a text message. False if it's closed.
+    fn send(_ text: String) -> Bool {
+        sendWebSocket(id, text: text)
+    }
+
+    // Sends a binary message. False if it's closed.
+    fn sendData(_ data: Data) -> Bool {
+        sendWebSocketData(id, data: data)
+    }
+
+    fn close() {
+        closeWebSocket(id)
+    }
+}
+
+// The blocks of a WebSocket (see `web.webSocket`).
+public struct SocketBlocks {
+    onOpen: fn(WebSocket)
+    onMessage: fn(WebSocket, String)
+    onData: fn(WebSocket, Data)?
+    onClose: fn(WebSocket, String)
+}
+
+// Turns the request into a WebSocket: `onOpen` when it's open, `onMessage`
+// with each text message (and binary ones, as text, without `onData`),
+// and `onClose` with why it closed. A request that doesn't ask for a
+// WebSocket gets a 400. Middleware runs first, as for any route (a
+// session or a password can be required), but the answer that opens the
+// WebSocket can't carry headers or cookies of its own.
+public fn webSocket(onOpen: fn(WebSocket) = openNothing, onMessage: fn(WebSocket, String),
+                    onData: fn(WebSocket, Data)? = nil, onClose: fn(WebSocket, String) = closeNothing) -> Response {
+    Response(status: 101, socket: SocketBlocks(onOpen: onOpen, onMessage: onMessage, onData: onData, onClose: onClose))
+}
+
+fn openNothing(_ socket: WebSocket) {}
+
+fn closeNothing(_ socket: WebSocket, _ reason: String) {}
+
+// Sends an answer for the request `id`: all at once, in pieces, or as a
+// WebSocket.
+fn sendAnswer(_ id: Int, _ response: Response) {
+    if let blocks = response.socket {
+        var ws = -1
+        ws = if let onData = blocks.onData {
+            acceptWebSocket(id, onMessage: { text in blocks.onMessage(WebSocket(id: ws), text) },
+                            onData: { data in onData(WebSocket(id: ws), data) },
+                            onClose: { reason in blocks.onClose(WebSocket(id: ws), reason) })
+        } else {
+            acceptWebSocket(id, onMessage: { text in blocks.onMessage(WebSocket(id: ws), text) },
+                            onClose: { reason in blocks.onClose(WebSocket(id: ws), reason) })
+        }
+        if ws == -1 {
+            respondHTTP(id, status: 400, headers: ["Content-Type": "text/plain; charset=utf-8"],
+                        body: Data(text: "This address takes a WebSocket"))
+        } else {
+            blocks.onOpen(WebSocket(id: ws))
+        }
+        return
+    }
+    let headers = wireHeaders(response)
+    if let write = response.stream {
+        if startHTTP(id, status: response.status, headers: headers) {
+            write(Stream(request: id))
+        }
+        return
+    }
+    respondHTTP(id, status: response.status, headers: headers, body: response.body)
 }

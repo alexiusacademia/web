@@ -1,12 +1,12 @@
 # The version of Tessel this project uses: Tessel's commands, editors and
 # the IDE run it with this version, whatever version is installed (and
 # install it the first time). `tessel pin` changes it.
-tessel = "0.23.1"
+tessel = "0.24.0"
 
 # What `tessel publish` publishes. Programs use the library by this name:
 # `tessel add web`, then `import web`.
 [library]
 name = "web"
-version = "0.2.0"
-description = "Web servers: routes, middleware, forms, cookies, sessions, static files and HTML templates"
+version = "0.3.0"
+description = "Web servers: routes, middleware, sessions, passwords, static files, HTML templates, streaming, WebSockets and worker threads"
 license = "MIT"

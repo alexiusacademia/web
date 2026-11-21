@@ -22,53 +22,71 @@ public struct SessionStore {
     count: fn() -> Int
 }
 
-// Sessions in memory: they end when the program does. At most `limit`
-// are kept: past it, the ones nearest their end go first.
-public fn memoryStore(limit: Int = 100000) -> SessionStore {
-    var items: [String: StoredSession] = [:]
-    var lastSweep = now()
+// The sessions of every `memoryStore`, for all threads: by store name
+// and id ("sessions|id").
+let memorySessions = Shared<[String: StoredSession]>([:])
+
+// Sessions in memory: they end when the program does. Stores with the same
+// `name` are the same sessions, so a server's workers, each making its own
+// store, all see every session. At most `limit` are kept: past it, the
+// ones nearest their end go first.
+public fn memoryStore(limit: Int = 100000, name: String = "sessions") -> SessionStore {
+    let prefix = name + "|"
     SessionStore(load: { id in
-        items[id]
+        memorySessions.get()[prefix + id]
     }, save: { id, session in
-        items[id] = session
-        // Forget ended sessions now and then, and when there are too many.
-        let t = now()
-        if t - lastSweep > 60 || items.count > limit {
-            var kept: [String: StoredSession] = [:]
-            for (k, s) in items {
-                if s.expires > t {
-                    kept[k] = s
+        memorySessions.update { all in
+            var items = all
+            items[prefix + id] = session
+            // Too many: forget ended sessions, then the ones nearest their end.
+            // (Looked at only when there are more than `limit` of all
+            // stores' sessions.)
+            let mine = if items.count > limit { items.keys.filter { k in k.hasPrefix(prefix) } } else { [] }
+            if mine.count > limit {
+                let t = now()
+                for k in mine {
+                    if (items[k]?.expires ?? 0) <= t {
+                        items[k] = nil
+                    }
+                }
+                let left = items.keys.filter { k in k.hasPrefix(prefix) }
+                if left.count > limit {
+                    let order = left.sorted(by: { x, y in (items[x]?.expires ?? 0) < (items[y]?.expires ?? 0) })
+                    for k in order.slice(from: 0, to: left.count - limit * 9 / 10) {
+                        items[k] = nil
+                    }
                 }
             }
-            items = kept
-            lastSweep = t
-            if items.count > limit {
-                // Keep the 90% that last longest.
-                let order = items.keys.sorted(by: { x, y in (items[x]?.expires ?? 0) > (items[y]?.expires ?? 0) })
-                var trimmed: [String: StoredSession] = [:]
-                for k in order.slice(from: 0, to: limit * 9 / 10) {
-                    trimmed[k] = items[k]
-                }
-                items = trimmed
-            }
+            items
         }
     }, remove: { id in
-        items[id] = nil
-    }, removeWhere: { test in
-        var kept: [String: StoredSession] = [:]
-        var removed = 0
-        for (k, s) in items {
-            if test(s.values) {
-                removed += 1
-            } else {
-                kept[k] = s
-            }
+        memorySessions.update { all in
+            var items = all
+            items[prefix + id] = nil
+            items
         }
-        items = kept
+    }, removeWhere: { test in
+        var removed = 0
+        memorySessions.update { all in
+            var items = all
+            for (k, s) in all {
+                if k.hasPrefix(prefix) && test(s.values) {
+                    items[k] = nil
+                    removed += 1
+                }
+            }
+            items
+        }
         removed
     }, count: {
         let t = now()
-        items.values.filter({ s in s.expires > t }).count
+        var n = 0
+        for (k, s) in memorySessions.get() {
+            if k.hasPrefix(prefix) && s.expires > t {
+                n += 1
+            }
+        }
+        n
     })
 }
 
@@ -82,6 +100,11 @@ public fn databaseStore(_ path: String, table: String = "web_sessions") -> Resul
         }
     }
     var db = try openDatabase(path)
+    // (A server's workers each open the file: one waits for another's write.)
+    match db.query("PRAGMA busy_timeout = 5000") {
+        .ok(_) -> {}
+        .failure(_) -> {}
+    }
     try db.execute("CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, data TEXT NOT NULL, expires REAL NOT NULL)")
     try db.execute("DELETE FROM {table} WHERE expires < ?", [now()])
     let store = SessionStore(load: { id in

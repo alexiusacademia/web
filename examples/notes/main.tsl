@@ -1,8 +1,9 @@
-// An example of web: a small notes site. Pages from templates with a
-// layout, a form that adds notes, a JSON API, a stylesheet from a folder,
-// and signing in: hashed passwords checked on another thread, server-side
-// sessions, CSRF tokens in the forms, and a limit on sign-in attempts.
-// Notes are kept in memory.
+// An example of web: a small notes site on four worker threads. Pages
+// from templates with a layout, a form that adds notes, a JSON API, live
+// updates over a WebSocket, a stylesheet from a folder, and signing in:
+// hashed passwords checked on another thread, server-side sessions, CSRF
+// tokens in the forms, and a limit on sign-in attempts. Notes are kept in
+// memory, in a `Shared` value all the workers see.
 //
 // Run it from the library's folder: `tessel run examples/notes`, then
 // open http://127.0.0.1:8080/ and sign in as "ann" with the password
@@ -27,13 +28,24 @@ struct HomePage {
     error: String = ""
 }
 
-fn main() {
+// The notes, for every worker.
+let notes = Shared([Note(id: 1, text: "Try adding a note", author: "web")])
+let nextId = Shared(2)
+
+// Names and password hashes; a real site keeps them in a database.
+let users = ["ann": web.hashPassword("tessel")]
+
+// The site, as each worker makes it.
+fn routes() -> web.Router {
     let secret = environment("NOTES_SECRET") ?? "change me: a long random text"
-    let pages = try web.loadTemplates(joinPath(appFolder(), "views"))
-    var notes = [Note(id: 1, text: "Try adding a note", author: "web")]
-    var nextId = 2
-    // Names and password hashes; a real site keeps them in a database.
-    let users = ["ann": web.hashPassword("tessel")]
+    var pages = web.Templates()
+    match web.loadTemplates(joinPath(appFolder(), "views")) {
+        .ok(loaded) -> { pages = loaded }
+        .failure(e) -> {
+            printError(e.message)
+            exit(1)
+        }
+    }
     let sessions = web.memoryStore()
 
     var router = web.Router()
@@ -47,7 +59,7 @@ fn main() {
     var site = web.Router()
     site.use(web.csrf(secret: secret))
     site.get("/") { r in
-        let page = HomePage(title: "Notes", user: r.session["user"] ?? "", notes: notes.reversed(),
+        let page = HomePage(title: "Notes", user: r.session["user"] ?? "", notes: notes.get().reversed(),
                             csrf: web.csrfField(r), error: r.queryValue("error") ?? "")
         web.page(pages, "home", page, layout: "layout")
     }
@@ -60,8 +72,8 @@ fn main() {
         if text.isEmpty {
             return web.redirect("/?error=Write+something", status: 303)
         }
-        notes.append(Note(id: nextId, text: text, author: user))
-        nextId += 1
+        let id = nextId.update { n in n + 1 } - 1
+        notes.update { list in list + [Note(id: id, text: text, author: user)] }
         web.redirect("/", status: 303)
     }
     site.post("/logout") { r in
@@ -90,9 +102,25 @@ fn main() {
     // The same notes as JSON, for programs.
     var api = web.Router()
     api.use(web.cors())
-    api.get("/notes") { r in web.json(notes) }
+    api.get("/notes") { r in web.json(notes.get()) }
+    // How many notes there are, sent again whenever it changes.
+    api.get("/live") { r in
+        web.webSocket(onOpen: { ws in
+            var last = -1
+            var timer = 0
+            timer = every(seconds: 0.5) {
+                let count = notes.get().count
+                if count != last {
+                    last = count
+                    if !ws.send("{count}") {
+                        stopTimer(timer)
+                    }
+                }
+            }
+        }, onMessage: { ws, text in })
+    }
     api.get("/notes/:id") { r in
-        for note in notes {
+        for note in notes.get() {
             if "{note.id}" == r.param("id") {
                 return web.json(note)
             }
@@ -101,8 +129,12 @@ fn main() {
     }
     router.mount("/api", api)
 
+    router
+}
+
+fn main() {
     let port = Int(environment("PORT") ?? "") ?? 8080
-    let server = web.serve(router, port: port)
+    let server = web.serveWorkers(routes, port: port, workers: 4)
     if server == -1 {
         print("can't serve: port {port} is taken")
         return

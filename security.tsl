@@ -23,79 +23,17 @@ public struct Tokens {
         toBase64Url(take(bytes).base64)
     }
 
-    // Whether the system's random bytes have arrived (see `tokens`).
+    // Always true: kept for programs written for web 0.2.
     fn isSeeded() -> Bool {
         seeded()
     }
 }
 
-// A source of secret tokens. Tessel 0.23 has no way to read the system's
-// secure random numbers directly (tessel#84), so this reads 64 bytes from
-// it once, with `od` and /dev/urandom on macOS, Linux and Android and
-// .NET's RandomNumberGenerator through PowerShell on Windows, a few
-// milliseconds after it's made, while the program runs. Each token is
-// then HMAC-SHA256 of a counter, keyed with those bytes and `secret`.
-// Tokens asked for before the bytes arrive (or if they can't be read,
-// which is reported on the error output) are keyed with `secret` alone,
-// with the time and Tessel's `random`: give a long random `secret` and
-// make the source when the program starts.
+// A source of secret tokens, from the system's secure random numbers
+// (`randomBytes`). `secret` is no longer needed (Tessel 0.23 had no
+// secure random numbers, and tokens were keyed with it), and is ignored.
 public fn tokens(secret: String = "") -> Tokens {
-    var seed = Data()
-    var ready = false
-    var counter = 0
-    var output = ""
-    let windows = platform() == "windows"
-    let path = if windows { "powershell" } else { "od" }
-    let args = if windows {
-        ["-NoProfile", "-NonInteractive", "-Command",
-         "[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(64))"]
-    } else {
-        ["-An", "-N64", "-tx1", "-v", "/dev/urandom"]
-    }
-    runCommand(path: path, args: args, onOutput: { line in
-        output += line.trim()
-    }) { code in
-        if code == 0 {
-            let bytes = if windows { decodeBase64(output) ?? Data() } else { hexBytes(output.replace(" ", with: "")) }
-            if bytes.count == 64 {
-                seed = bytes
-                ready = true
-            }
-        }
-        if !ready {
-            printError("web: can't read random bytes from the system ({path} gave {code}); tokens rest on the secret alone")
-        }
-    }
-    Tokens(take: { count in
-        var out = Data()
-        while out.count < count {
-            counter += 1
-            if ready {
-                out += hmac(key: seed + Data(text: secret), message: Data(text: "web token {counter}"))
-            } else {
-                let mixed = "{counter}:{now()}:{random(0..2147483647)}:{random(0..2147483647)}:{randomFloat()}"
-                out += hmac(key: Data(text: secret + ":web tokens"), message: Data(text: mixed))
-            }
-        }
-        out.slice(from: 0, to: count)
-    }, seeded: { ready })
-}
-
-// Bytes from hexadecimal digits ("0aff"), or fewer if a digit is wrong.
-fn hexBytes(_ hex: String) -> Data {
-    let chars = hex.characters
-    var out = Data()
-    var i = 0
-    while i + 1 < chars.count {
-        let hi = hexDigit(chars[i])
-        let lo = hexDigit(chars[i + 1])
-        if hi < 0 || lo < 0 {
-            return out
-        }
-        out.append(byte: hi * 16 + lo)
-        i += 2
-    }
-    out
+    Tokens(take: { count in randomBytes(count) }, seeded: { true })
 }
 
 // ---- Passwords ----
@@ -143,9 +81,7 @@ let maxIterations = 10000000
 // 600,000 rounds take about half a second; on a busy server, use
 // `hashPasswordLater`.
 public fn hashPassword(_ password: String, iterations: Int = 600000) -> String {
-    // A salt only has to be different for each hash, not secret.
-    let mixed = Data(text: "{now()}:{random(0..2147483647)}:{random(0..2147483647)}:{randomFloat()}:{password.count}")
-    let salt = toBase64Url(mixed.hash().base64).replace("-", with: "a").replace("_", with: "b").substring(from: 0, to: 22)
+    let salt = toBase64Url(randomBytes(16).base64).replace("-", with: "a").replace("_", with: "b").substring(from: 0, to: 22)
     let rounds = min(max(iterations, 1), maxIterations)
     let derived = pbkdf2(password: Data(text: password), salt: Data(text: salt), iterations: rounds)
     "pbkdf2_sha256${rounds}${salt}${derived.base64}"
@@ -272,39 +208,50 @@ struct RateWindow {
     count: Int
 }
 
+// The counts of every `rateLimit`, for all threads (a server's workers
+// each make their own middleware; the counts are the same for all): by
+// limit and client.
+let rateCounts = Shared<[String: RateWindow]>([:])
+
 // Lets each client make at most `requests` requests every `seconds`;
 // more get a 429 with Retry-After. Clients are told apart by `key`: their
 // IP address unless you say otherwise (a user's name, an API key); an
 // IPv6 address counts by its first half (its /64 network), since one
-// client usually has a whole /64.
-// Answers carry RateLimit-Limit, RateLimit-Remaining and RateLimit-Reset.
-// The counts are kept in memory, for this server only.
+// client usually has a whole /64. Answers carry RateLimit-Limit,
+// RateLimit-Remaining and RateLimit-Reset.
+//
+// The counts are kept in memory, for this program, and shared by a
+// server's workers. Limits with the same `name` share their counts: give
+// each of several limits a name of its own.
 public fn rateLimit(requests: Int, seconds: Float, key: fn(Request) -> String = clientIP,
-                    maxClients: Int = 100000) -> Middleware {
-    var windows: [String: RateWindow] = [:]
-    var lastSweep = now()
+                    maxClients: Int = 100000, name: String = "") -> Middleware {
+    let prefix = "{name}|{requests}|{seconds}|"
     Middleware(before: { request in
         let t = now()
-        // Forget clients whose window has ended, now and then, and when
-        // there are too many (then, if they're all still counting, start
-        // again rather than run out of memory).
-        if t - lastSweep > max(seconds, 60.0) || windows.count > maxClients {
-            var kept: [String: RateWindow] = [:]
-            for (k, w) in windows {
-                if t - w.start < seconds {
-                    kept[k] = w
+        let k = prefix + key(request)
+        var w = RateWindow(start: t, count: 0)
+        rateCounts.update { all in
+            var counts = all
+            // Too many clients: forget those whose window has ended (and,
+            // if all are still counting, start again rather than run out
+            // of memory).
+            if counts.count > maxClients {
+                var kept: [String: RateWindow] = [:]
+                for (ck, cw) in counts {
+                    if t - cw.start < seconds {
+                        kept[ck] = cw
+                    }
                 }
+                counts = if kept.count > maxClients { [:] } else { kept }
             }
-            windows = if kept.count > maxClients { [:] } else { kept }
-            lastSweep = t
+            w = counts[k] ?? RateWindow(start: t, count: 0)
+            if t - w.start >= seconds {
+                w = RateWindow(start: t, count: 0)
+            }
+            w.count += 1
+            counts[k] = w
+            counts
         }
-        let k = key(request)
-        var w = windows[k] ?? RateWindow(start: t, count: 0)
-        if t - w.start >= seconds {
-            w = RateWindow(start: t, count: 0)
-        }
-        w.count += 1
-        windows[k] = w
         var passed = request
         let reset = max(Int(w.start + seconds - t + 0.999), 1)
         passed.values["web.rate"] = "{requests},{max(requests - w.count, 0)},{reset}"

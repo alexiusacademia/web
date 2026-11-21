@@ -533,7 +533,7 @@ fn security(_ t: Tally) -> Tally {
     t2.check("token is URL-safe", !a.contains("+") && !a.contains("/") && !a.contains("="))
     t2.number("short token", source.token(bytes: 3).count, 4)
     t2.number("bytes", source.bytes(70).count, 70)
-    t2.check("not seeded at once", !source.isSeeded())
+    t2.check("seeded at once", source.isSeeded())
     let zero = web.hashPassword("z", iterations: 0)
     t2.check("at least one round", zero.hasPrefix("pbkdf2_sha256$1$") && web.checkPassword("z", zero))
     t2.check("too many rounds refused", !web.checkPassword("z", "pbkdf2_sha256$10000001$abc$xyz"))
@@ -570,7 +570,7 @@ fn security(_ t: Tally) -> Tally {
              hostCookie[0].contains("; Secure"))
 
     // With sessions, the token lives in the session, and changes at sign-in.
-    let store = web.memoryStore()
+    let store = web.memoryStore(name: "csrf test")
     var bound = web.Router()
     bound.use(web.sessions(secret: "a secret of at least sixteen characters", store: store))
     bound.use(web.csrf(secret: "a csrf secret, sixteen or more"))
@@ -652,7 +652,7 @@ fn security(_ t: Tally) -> Tally {
 
 fn stores(_ t: Tally) -> Tally {
     var t2 = t
-    let store = web.memoryStore()
+    let store = web.memoryStore(name: "stores test")
     var router = web.Router()
     router.use(web.sessions(secret: "a secret of at least sixteen characters", store: store))
     router.post("/login") { r in web.text("in").withSession(["user": r.queryValue("user") ?? ""]) }
@@ -705,7 +705,7 @@ fn stores(_ t: Tally) -> Tally {
     t2.number("no sessions", store.count(), 0)
     t2.same("unsigned id refused", ask(router, "GET", "/", headers: ["Cookie": "session={c3.substring(from: 0, to: c3.findLast(".") ?? 0)}"]).text(), "user=none")
 
-    let small = web.memoryStore(limit: 10)
+    let small = web.memoryStore(limit: 10, name: "limit test")
     for i in 0..25 {
         small.save("id{i}", web.StoredSession(values: ["n": "{i}"], expires: now() + Float(100 + i)))
     }
@@ -877,6 +877,113 @@ struct Page {
     users: [User]
 }
 
+// What the workers of `workerTests` count together.
+let workerHits = Shared(0)
+
+// The router each worker of `workerTests` makes.
+fn workerRoutes() -> web.Router {
+    var router = web.Router()
+    router.use(web.sessions(secret: "a secret of at least sixteen characters", store: web.memoryStore(name: "workers test")))
+    router.use(web.rateLimit(requests: 1000, seconds: 60, name: "workers test"))
+    router.post("/login") { r in web.text("in").withSession(["user": "ann"], renew: true) }
+    router.get("/me") { r in web.text("user={r.session["user"] ?? "none"} hit {workerHits.update { n in n + 1 }}") }
+    router.get("/crash") { r in
+        let list = [1]
+        web.text("{list[r.query.count + 5]}")
+    }
+    router.get("/events") { r in
+        web.events { out in
+            out.event("one")
+            out.event("two\nlines", name: "multi", id: "7")
+            out.end()
+        }
+    }
+    router.get("/stream") { r in
+        web.stream { out in
+            var n = 0
+            var timer = 0
+            timer = every(seconds: 0.01) {
+                n += 1
+                out.send("piece {n};")
+                if n == 3 {
+                    stopTimer(timer)
+                    out.end()
+                }
+            }
+        }
+    }
+    router.get("/ws") { r in
+        web.webSocket(onOpen: { ws in ws.send("hello {r.session["user"] ?? "nobody"}") }, onMessage: { ws, text in
+            ws.send("echo {text}")
+        }, onData: { ws, data in
+            ws.sendData(data + Data(bytes: [0]))
+        })
+    }
+    router
+}
+
+// A server on three workers: a session made on one is seen by the others,
+// counts are shared, a crash answers 500 and the server goes on, and
+// answers in pieces and WebSockets work from routes.
+fn workerTests(_ t: Tally, _ done: fn(Tally)) {
+    var t2 = t
+    let server = web.serveWorkers(workerRoutes, port: 0, workers: 3)
+    t2.check("workers serving", server > 0)
+    let base = "http://127.0.0.1:{tcpPort(server)}"
+    request(url: "{base}/login", method: "POST") { login in
+        let line = login.headers["set-cookie"] ?? ""
+        let cookie = line.substring(from: 0, to: line.find(";") ?? line.count)
+        t2.check("worker login", login.text == "in" && cookie.hasPrefix("session="))
+        var left = 6
+        var seen: [String] = []
+        for _ in 0..6 {
+            request(url: "{base}/me", headers: ["Cookie": cookie]) { me in
+                seen.append(me.text.substring(from: 0, to: 8))
+                left -= 1
+                if left > 0 {
+                    return
+                }
+                t2.same("session on every worker", toJson(seen), toJson(["user=ann", "user=ann", "user=ann", "user=ann", "user=ann", "user=ann"]))
+                t2.number("hits counted together", workerHits.get(), 6)
+                request(url: "{base}/crash") { crash in
+                    t2.number("a crash answers 500", crash.status, 500)
+                    request(url: "{base}/me", headers: ["Cookie": cookie]) { after in
+                        t2.check("still serving after a crash", after.text.hasPrefix("user=ann"))
+                        request(url: "{base}/events") { ev in
+                            t2.same("events type", ev.headers["content-type"] ?? "", "text/event-stream")
+                            t2.same("events", ev.text, "data: one\n\nevent: multi\nid: 7\ndata: two\ndata: lines\n\n")
+                            request(url: "{base}/stream") { st in
+                                t2.same("stream", st.text, "piece 1;piece 2;piece 3;")
+                                t2.same("stream chunked", st.headers["transfer-encoding"] ?? "", "chunked")
+                                request(url: "{base}/ws") { plain in
+                                    t2.number("not a websocket", plain.status, 400)
+                                    var got: [String] = []
+                                    var ws = -1
+                                    ws = openWebSocket(url: "ws://127.0.0.1:{tcpPort(server)}/ws", onMessage: { text in
+                                        got.append(text)
+                                        if got.count == 1 {
+                                            sendWebSocket(ws, text: "x")
+                                        } else {
+                                            sendWebSocketData(ws, data: Data(bytes: [5]))
+                                        }
+                                    }, onData: { data in
+                                        got.append("{data.bytes}")
+                                        closeWebSocket(ws)
+                                    }) { reason in
+                                        t2.same("websocket route", toJson(got), toJson(["hello nobody", "echo x", "[5, 0]"]))
+                                        stopHTTP(server)
+                                        done(t2)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Prints the count and ends the program.
 fn finish(_ t: Tally) {
     print("{t.passed} passed, {t.failed} failed")
@@ -927,7 +1034,7 @@ fn main() {
             let text = received.text ?? ""
             t.check("status line", text.hasPrefix("HTTP/1.1 200 OK\r\n"))
             t.check("two cookies on the wire", text.contains("\r\nSet-Cookie: a=1; Path=/; HttpOnly; SameSite=Lax\r\n") &&
-                    text.contains("\r\nset-Cookie: b=2; Path=/; HttpOnly; SameSite=Lax\r\n"))
+                    text.contains("\r\nSet-Cookie: b=2; Path=/; HttpOnly; SameSite=Lax\r\n"))
             request(url: "http://127.0.0.1:{port}/slow?n=2") { answer in
                 t.same("served later route", answer.text, "slow 2")
                 request(url: "http://127.0.0.1:{port}/numbers.bin", headers: ["Range": "bytes=0-2"]) { part in
@@ -943,7 +1050,9 @@ fn main() {
                         web.checkPasswordLater("later", hash) { ok in
                             t.check("passwords on another thread", ok && hash.hasPrefix("pbkdf2_sha256$2000$"))
                             after(seconds: 0.7) {
-                                finish(t)
+                                workerTests(t) { done in
+                                    finish(done)
+                                }
                             }
                         }
                     }
