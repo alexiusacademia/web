@@ -1,0 +1,643 @@
+<!doctype html>
+<!--
+  web's website: https://web-package.syncster.dev
+  Author: Alexius Academia
+  Date: 2026-11-21
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="author" content="Alexius Academia">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>web · Web servers for Tessel</title>
+  <meta name="description" content="web is a Tessel library for web servers: routes with values in the path, middleware, forms, uploads, cookies, signed sessions, static files and HTML templates.">
+  <meta name="theme-color" content="#c93045">
+  <link rel="canonical" href="https://web-package.syncster.dev/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="web">
+  <meta property="og:title" content="web · Web servers for Tessel">
+  <meta property="og:description" content="Routes, middleware, forms, cookies, signed sessions, static files and Handlebars-style templates for Tessel programs. Nothing else to install.">
+  <meta property="og:url" content="https://web-package.syncster.dev/">
+  <meta property="og:image" content="https://web-package.syncster.dev/assets/share.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="A route handler in Tessel beside the HTTP response it gives">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#c93045"/><g fill="none" stroke="#fff" stroke-width="2"><circle cx="16" cy="16" r="9"/><ellipse cx="16" cy="16" rx="4" ry="9"/><path d="M7.5 13 H24.5 M7.5 19 H24.5"/></g></svg>
+      web <small>for Tessel</small>
+    </a>
+    <nav>
+      <a href="#examples">Examples</a>
+      <a href="#tested" class="optional">Tested</a>
+      <a href="#reference">Reference</a>
+      <a href="https://github.com/alexiusacademia/web">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<div class="hero">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">A Tessel library</p>
+      <h1>Web servers in a few lines of Tessel.</h1>
+      <p class="lede">Routes with values in the path, middleware, forms, uploads, cookies, signed sessions, folders of static files and HTML templates. It's built on Tessel's own HTTP server, with nothing else to install.</p>
+      <div class="install">
+        <code>tessel add web</code>
+        <button class="copy" type="button" data-copy="tessel add web">Copy</button>
+      </div>
+      <div class="buttons">
+        <a class="button primary" href="#examples">See examples</a>
+        <a class="button" href="https://github.com/alexiusacademia/web">Code on GitHub</a>
+      </div>
+      <p class="meta">MIT licence · Tessel 0.23.1 or later · no dependencies</p>
+    </div>
+    <div class="preview">
+      <div class="panel">
+        <header><b>main.tsl</b></header>
+<pre class="tsl">import web
+
+fn main() {
+    var router = web.Router()
+    router.get("/hello/:name") { r in
+        web.json(["greeting": "Hello, {r.param("name")}!"])
+    }
+    web.serve(router, port: 8080)
+}</pre>
+      </div>
+      <div class="arrow">↓ <code>curl -i 127.0.0.1:8080/hello/Ann%20Lee</code></div>
+      <div class="panel">
+        <header><b>Response</b></header>
+<pre class="http">HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 30
+
+{"greeting":"Hello, Ann Lee!"}</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<section id="examples">
+  <div class="wrap">
+    <h2>Examples</h2>
+    <p class="intro">Each program below was run with the library, and the output below it is what it printed or what <code>curl</code> got back. <code>app</code> is a word Tessel keeps for apps, so the router is called <code>router</code>.</p>
+
+    <div class="examples">
+
+      <article class="example" id="json">
+        <h3>A JSON API</h3>
+        <p><code>:id</code> takes one part of the path. <code>web.json</code> sends any value as JSON, and <code>web.readJson</code> reads a body into your type, or gives <code>nil</code> if it isn't JSON of that shape. A path that only other methods answer gets a 405 with an <code>Allow</code> header.</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+struct Item {
+    id: Int
+    name: String
+}
+
+fn main() {
+    var items = [Item(id: 1, name: "Tea")]
+
+    var router = web.Router()
+    router.use(web.logger())
+    router.get("/items") { r in web.json(items) }
+    router.get("/items/:id") { r in
+        for item in items {
+            if "{item.id}" == r.param("id") {
+                return web.json(item)
+            }
+        }
+        web.status(404)
+    }
+    router.post("/items") { r in
+        let sent: Item? = web.readJson(r)
+        if let item = sent {
+            items.append(item)
+            return web.json(item, status: 201)
+        }
+        web.status(400, "send an item as JSON")
+    }
+    web.serve(router, port: 8080)
+}</pre>
+          </div>
+          <div class="out">
+            <p class="label">With curl</p>
+<pre class="http">$ curl 127.0.0.1:8080/items
+[{"id":1,"name":"Tea"}]
+$ curl -d '{"id": 2, "name": "Coffee"}' 127.0.0.1:8080/items
+{"id":2,"name":"Coffee"}
+$ curl 127.0.0.1:8080/items/2
+{"id":2,"name":"Coffee"}
+$ curl -d 'oops' 127.0.0.1:8080/items
+send an item as JSON
+$ curl -i -X DELETE 127.0.0.1:8080/items
+HTTP/1.1 405 Method Not Allowed
+Content-Type: text/plain; charset=utf-8
+Allow: GET, HEAD, OPTIONS, POST
+Content-Length: 18
+
+Method Not Allowed</pre>
+            <p class="label">What the server prints</p>
+<pre>127.0.0.1 GET /items 200 23 B 0.05 ms
+127.0.0.1 POST /items 201 24 B 0.02 ms
+127.0.0.1 GET /items/2 200 24 B 0.01 ms
+127.0.0.1 POST /items 400 20 B 0.02 ms
+127.0.0.1 DELETE /items 405 18 B 0.01 ms</pre>
+          </div>
+        </div>
+      </article>
+
+      <article class="example" id="forms">
+        <h3>Forms, redirects and uploads</h3>
+        <p><code>r.form()</code> reads a form, urlencoded or multipart. After a form, answer with a 303 so a reload doesn't send it again. <code>r.file(name)</code> gives an uploaded file with its name, type and bytes.</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+fn main() {
+    var names: [String] = []
+
+    var router = web.Router()
+    router.get("/") { r in
+        let error = r.queryValue("error") ?? ""
+        web.text("Signed by: {names.joined(separator: ", ")}\n{error}")
+    }
+    router.post("/sign") { r in
+        let name = (r.form()["name"] ?? "").trim()
+        if name.isEmpty {
+            return web.redirect("/?error=Write+a+name", status: 303)
+        }
+        names.append(name)
+        web.redirect("/", status: 303)
+    }
+    router.post("/upload") { r in
+        if let f = r.file("photo") {
+            return web.text("{f.fileName ?? "?"}: {f.data.count} bytes of {f.contentType}")
+        }
+        web.status(400, "no photo")
+    }
+    web.serve(router, port: 8080)
+}</pre>
+          </div>
+          <div class="out">
+            <p class="label">With curl</p>
+<pre class="http">$ curl -i -d 'name=Ann+Lee' 127.0.0.1:8080/sign
+HTTP/1.1 303 See Other
+Location: /
+Content-Length: 0
+
+$ curl -L -d 'name=Ben' 127.0.0.1:8080/sign
+Signed by: Ann Lee, Ben
+
+$ curl -L -d 'name=' 127.0.0.1:8080/sign
+Signed by: Ann Lee, Ben
+Write a name
+$ curl -F 'photo=@cat.gif' 127.0.0.1:8080/upload
+cat.gif: 17 bytes of image/gif</pre>
+          </div>
+        </div>
+      </article>
+
+      <article class="example" id="sessions">
+        <h3>Signing in with a session</h3>
+        <p>The session's values are kept in a cookie signed with HMAC-SHA256, so they can't be changed without the secret. They can be read, so never put a password in them. The secret must be at least 16 characters; keep it out of the code.</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+fn main() {
+    var router = web.Router()
+    router.use(web.sessions(secret: environment("SESSION_SECRET") ?? ""))
+    router.post("/login") { r in
+        let form = r.form()
+        if form["password"] != "tessel" {
+            return web.redirect("/?wrong", status: 303)
+        }
+        web.redirect("/", status: 303).withSession(["user": form["name"] ?? ""])
+    }
+    router.get("/") { r in web.text("Hello, {r.session["user"] ?? "stranger"}") }
+    router.post("/logout") { r in web.redirect("/", status: 303).withSession([:]) }
+    web.serve(router, port: 8080)
+}</pre>
+          </div>
+          <div class="out">
+            <p class="label">With curl, keeping cookies in a jar</p>
+<pre class="http">$ curl 127.0.0.1:8080/
+Hello, stranger
+$ curl -i -c jar -d 'name=Ann&amp;password=tessel' 127.0.0.1:8080/login
+HTTP/1.1 303 See Other
+Location: /
+Set-Cookie: session=eyJ2YWx1ZXMiOnsidXNlciI6IkFubiJ9LCJleHBpcmVzIjoxNzk2NDcwODYwLjQ4MTkyN30._TIa8ZHLsQqQm3YciECzdfBQp7h2d3FSVA9o9Hu1OKQ; Max-Age=1209600; Expires=Sat, 05 Dec 2026 11:41:00 GMT; Path=/; HttpOnly; SameSite=Lax
+Content-Length: 0
+
+$ curl -b jar 127.0.0.1:8080/
+Hello, Ann
+$ curl -b jar -c jar -d '' 127.0.0.1:8080/logout
+$ curl -b jar 127.0.0.1:8080/
+Hello, stranger</pre>
+            <p class="note">A cookie with “Ann” changed to “Bob” and the old signature kept gets “Hello, stranger”.</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="example" id="files">
+        <h3>Static files</h3>
+        <p>Each file goes with its content type, <code>ETag</code> and <code>Last-Modified</code>. A browser that has the file already gets a 304 and no bytes, and a <code>Range</code> request gets only those bytes. Hidden files and names with <code>..</code> aren't sent.</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+fn main() {
+    var router = web.Router()
+    router.files("/static", folder: "public")
+    web.serve(router, port: 8080)
+}</pre>
+            <p class="label">public/css/site.css</p>
+<pre>body { font: 16px/1.5 system-ui; color: #222; }</pre>
+          </div>
+          <div class="out">
+            <p class="label">With curl</p>
+<pre class="http">$ curl -i 127.0.0.1:8080/static/css/site.css
+HTTP/1.1 200 OK
+Content-Type: text/css; charset=utf-8
+Last-Modified: Sat, 21 Nov 2026 11:41:20 GMT
+ETag: "30-6b018360"
+Accept-Ranges: bytes
+Cache-Control: no-cache
+Content-Length: 48
+
+body { font: 16px/1.5 system-ui; color: #222; }
+
+$ curl -i -H 'If-None-Match: "30-6b018360"' 127.0.0.1:8080/static/css/site.css
+HTTP/1.1 304 Not Modified
+ETag: "30-6b018360"
+Last-Modified: Sat, 21 Nov 2026 11:41:20 GMT
+Cache-Control: no-cache
+Content-Length: 0
+
+$ curl -i -H 'Range: bytes=0-3' 127.0.0.1:8080/static/css/site.css
+HTTP/1.1 206 Partial Content
+Content-Type: text/css; charset=utf-8
+Last-Modified: Sat, 21 Nov 2026 11:41:20 GMT
+ETag: "30-6b018360"
+Accept-Ranges: bytes
+Cache-Control: no-cache
+Content-Range: bytes 0-3/48
+Content-Length: 4
+
+body
+$ curl -i 127.0.0.1:8080/static/.env
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+Content-Length: 9
+
+Not Found</pre>
+          </div>
+        </div>
+      </article>
+
+      <article class="example" id="templates">
+        <h3>Templates with a layout</h3>
+        <p>Templates are written like Handlebars templates and give what Handlebars gives. Values are escaped for HTML; <code>{{{body}}}</code> puts the page into the layout as it is. In a handler, <code>web.page(pages, "shop", shop, layout: "layout")</code> is the same page as an answer.</p>
+        <div class="split">
+          <div>
+            <p class="label">views/shop.html</p>
+<pre class="hbs">&lt;h1&gt;{{title}}&lt;/h1&gt;
+&lt;ul&gt;
+  {{#each items}}
+  &lt;li&gt;{{name}}: ${{price}}{{#if @first}} (new){{/if}}&lt;/li&gt;
+  {{else}}
+  &lt;li&gt;Nothing for sale&lt;/li&gt;
+  {{/each}}
+&lt;/ul&gt;</pre>
+            <p class="label">views/layout.html</p>
+<pre class="hbs">&lt;!doctype html&gt;
+&lt;title&gt;{{title}}&lt;/title&gt;
+{{{body}}}</pre>
+            <p class="label">main.tsl</p>
+<pre class="tsl">import web
+
+struct Item {
+    name: String
+    price: Float
+}
+
+struct Shop {
+    title: String
+    items: [Item]
+}
+
+fn main() {
+    let pages = try web.loadTemplates("views")
+    let shop = Shop(title: "Tea &amp; &lt;coffee&gt;", items: [Item(name: "Green tea", price: 3.5), Item(name: "Espresso", price: 2.25)])
+    print(web.render(pages, "shop", shop, layout: "layout"))
+    print(web.render(pages, "shop", Shop(title: "Closed", items: [])))
+}</pre>
+          </div>
+          <div class="out">
+            <p class="label">Output</p>
+<pre>&lt;!doctype html&gt;
+&lt;title&gt;Tea &amp;amp; &amp;lt;coffee&amp;gt;&lt;/title&gt;
+&lt;h1&gt;Tea &amp;amp; &amp;lt;coffee&amp;gt;&lt;/h1&gt;
+&lt;ul&gt;
+  &lt;li&gt;Green tea: $3.5 (new)&lt;/li&gt;
+  &lt;li&gt;Espresso: $2.25&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h1&gt;Closed&lt;/h1&gt;
+&lt;ul&gt;
+  &lt;li&gt;Nothing for sale&lt;/li&gt;
+&lt;/ul&gt;</pre>
+          </div>
+        </div>
+      </article>
+
+      <article class="example" id="middleware">
+        <h3>Middleware of your own</h3>
+        <p>A middleware's <code>before</code> passes a request on with <code>web.next</code> or answers it with <code>web.stop</code>; its <code>after</code> can change each answer. The befores run in the order added, the afters in the opposite order.</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+fn main() {
+    var router = web.Router()
+    router.use(web.onRequest { r in
+        if r.header("x-api-key") != "secret" {
+            return web.stop(web.status(401))
+        }
+        web.next(r)
+    })
+    router.use(web.onResponse { r, res in res.withHeader("X-Served-By", "web") })
+    router.get("/report") { r in web.text("all good") }
+    web.serve(router, port: 8080)
+}</pre>
+          </div>
+          <div class="out">
+            <p class="label">With curl</p>
+<pre class="http">$ curl -i 127.0.0.1:8080/report
+HTTP/1.1 401 Unauthorized
+Content-Type: text/plain; charset=utf-8
+Content-Length: 12
+
+Unauthorized
+$ curl -i -H 'X-API-Key: secret' 127.0.0.1:8080/report
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+X-Served-By: web
+Content-Length: 8
+
+all good</pre>
+          </div>
+        </div>
+      </article>
+
+      <article class="example" id="testing">
+        <h3>Testing without a network</h3>
+        <p><code>web.call(router, method, path, body:, headers:)</code> runs a request through a router and gives the answer, so a test needs no server and no port.</p>
+        <div class="split">
+          <div>
+<pre class="tsl">import web
+
+fn routes() -> web.Router {
+    var router = web.Router()
+    router.get("/hello/:name") { r in web.text("Hello, {r.param("name")}!") }
+    router
+}
+
+test "greets by name" {
+    let answer = web.call(routes(), "GET", "/hello/Ann%20Lee")
+    expect(answer?.status == 200)
+    expect(answer?.text() == "Hello, Ann Lee!")
+}
+
+test "other paths are not found" {
+    expect(web.call(routes(), "GET", "/bye")?.status == 404)
+}</pre>
+          </div>
+          <div class="out">
+            <p class="label">Running <code>tessel test .</code></p>
+<pre>ok    greets by name  (10 ms)
+ok    other paths are not found  (8 ms)
+
+2 passed, 0 failed, in 0.01 s</pre>
+          </div>
+        </div>
+      </article>
+
+    </div>
+    <p class="note"><code>examples/notes</code> in the repository is a whole small site: pages from templates with a layout, a form, signing in with a session, a JSON API and a stylesheet.</p>
+  </div>
+</section>
+
+<section id="tested">
+  <div class="wrap">
+    <h2>Tested</h2>
+    <p class="intro"><code>tessel run tests</code> runs the router, requests and responses, the middleware, signing, files, templates, and a real server over TCP. The templates are compared with what Handlebars 4.7.8 gives, on cases written by hand and many made at random. Signing is checked with the RFC 4231 test values and values from Python's <code>hmac</code>.</p>
+    <div class="stats">
+      <div class="stat"><b>3,316</b><span>checks, all passing</span></div>
+      <div class="stat"><b>3,076</b><span>templates that give what Handlebars 4.7.8 gives</span></div>
+      <div class="stat"><b>RFC 4231</b><span>and Python's <code>hmac</code> for the HMAC-SHA256 that signs sessions</span></div>
+      <div class="stat"><b>~90,000</b><span>requests a second for a JSON API</span></div>
+      <div class="stat"><b>~45,000</b><span>requests a second for a page from templates with a layout</span></div>
+      <div class="stat"><b>~34,000</b><span>requests a second for a static stylesheet</span></div>
+    </div>
+    <p class="note">Speeds are from ApacheBench (<code>ab -k -c 20</code>) against <code>examples/notes</code> on an M-series Mac.</p>
+  </div>
+</section>
+
+<section id="reference">
+  <div class="wrap">
+    <h2>Reference</h2>
+    <p class="intro">The <a href="https://github.com/alexiusacademia/web#readme">README</a> has all of it, with more detail.</p>
+
+    <h3>Router</h3>
+    <div class="table"><table>
+      <tr><th>Method</th><th></th></tr>
+      <tr><td><code>get</code>, <code>post</code>, <code>put</code>, <code>patch</code>, <code>delete(pattern) { r in … }</code></td><td>Answers requests with that method whose path fits the pattern. A <code>get</code> route answers HEAD too.</td></tr>
+      <tr><td><code>any(pattern) { … }</code></td><td>Any method.</td></tr>
+      <tr><td><code>add(method, pattern) { … }</code></td><td>Another method (<code>"PROPFIND"</code>).</td></tr>
+      <tr><td><code>later(method, pattern) { r, reply in … }</code></td><td>A handler that calls <code>reply</code> when the answer is ready: after a request of its own, a timer or <code>background</code> work.</td></tr>
+      <tr><td><code>use(middleware)</code></td><td>Middleware for every request, in the order added.</td></tr>
+      <tr><td><code>mount(prefix, router)</code></td><td>Another router's routes under a prefix. Its middleware runs only for its routes.</td></tr>
+      <tr><td><code>files(prefix, folder:, options:)</code></td><td>A folder of files. <code>FileOptions</code> has <code>index</code>, <code>maxAge</code> and <code>dotFiles</code>.</td></tr>
+      <tr><td><code>notFound { r in … }</code></td><td>What answers when no route fits.</td></tr>
+    </table></div>
+    <p class="intro" style="margin-top:14px">A pattern's parts can be <code>:name</code> (one part of the path) or, at the end, <code>*name</code> (the rest of the path). Fixed text wins over <code>:name</code>, and <code>:name</code> over <code>*name</code>, whatever order the routes were added in. <code>web.serve(router, port:, host:)</code> starts the server and returns its id, or -1 if it can't listen. It listens on this computer only unless <code>host: "0.0.0.0"</code>, and speaks HTTP/1.1, not HTTPS: on the internet, put it behind a server that does HTTPS.</p>
+
+    <h3>Requests</h3>
+    <div class="table"><table>
+      <tr><th>Field or method</th><th></th></tr>
+      <tr><td><code>method</code>, <code>path</code>, <code>query</code></td><td><code>"GET"</code>, <code>"/users/3"</code>, <code>"page=2"</code>. The path is tidied as the router sees it.</td></tr>
+      <tr><td><code>headers</code>, <code>header(name)</code></td><td>Names in lowercase; <code>header</code> takes any case.</td></tr>
+      <tr><td><code>body</code>, <code>text()</code></td><td>The body as <code>Data</code>, and as text.</td></tr>
+      <tr><td><code>param(name)</code>, <code>params</code></td><td>Values from the pattern, decoded.</td></tr>
+      <tr><td><code>queryValue(name)</code>, <code>queryValues(name)</code>, <code>queryDict()</code></td><td>The query, decoded.</td></tr>
+      <tr><td><code>form()</code></td><td>The fields of a form: urlencoded or multipart.</td></tr>
+      <tr><td><code>parts()</code>, <code>file(name)</code></td><td>The parts of a multipart body, and an uploaded file: <code>name</code>, <code>fileName</code>, <code>contentType</code>, <code>data</code>.</td></tr>
+      <tr><td><code>cookies()</code>, <code>cookie(name)</code></td><td>The cookies the browser sent.</td></tr>
+      <tr><td><code>accepts(type)</code>, <code>contentType()</code></td><td>Whether the Accept header takes a type; the body's type without parameters.</td></tr>
+      <tr><td><code>values</code>, <code>session</code></td><td>Notes left by middleware, and the session's values.</td></tr>
+      <tr><td><code>remote</code>, <code>received</code></td><td>The client's address, and when the request came.</td></tr>
+      <tr><td><code>web.readJson(r)</code></td><td>The body as JSON in your type, or <code>nil</code>.</td></tr>
+    </table></div>
+
+    <h3>Responses</h3>
+    <div class="table"><table>
+      <tr><th>Function</th><th></th></tr>
+      <tr><td><code>web.text(text, status:)</code></td><td>Plain text.</td></tr>
+      <tr><td><code>web.html(html, status:)</code></td><td>A page.</td></tr>
+      <tr><td><code>web.json(value, status:)</code></td><td>Any value as JSON: a struct, a list, a dictionary.</td></tr>
+      <tr><td><code>web.bytes(data, type:, status:)</code></td><td>Bytes with a content type.</td></tr>
+      <tr><td><code>web.redirect(to, status:)</code></td><td>302 by default; 303 after a form, 301 or 308 for good.</td></tr>
+      <tr><td><code>web.status(code, message)</code></td><td>A status with its reason as the body, or a message.</td></tr>
+      <tr><td><code>web.file(path, request, maxAge:, download:)</code></td><td>A file, with caching and ranges.</td></tr>
+      <tr><td><code>web.page(templates, name, data, layout:)</code></td><td>A page from templates.</td></tr>
+    </table></div>
+    <p class="intro" style="margin-top:14px">A <code>web.Response</code> (<code>status</code>, <code>headers</code>, <code>body</code>) changes with <code>withHeader</code>, <code>withStatus</code>, <code>withCookie(name, value, maxAge:, path:, domain:, httpOnly:, secure:, sameSite:)</code>, <code>withoutCookie</code> and <code>withSession</code>. Cookies are <code>HttpOnly</code> and <code>SameSite=Lax</code> unless you say otherwise.</p>
+
+    <h3>Middleware</h3>
+    <div class="table"><table>
+      <tr><th>Middleware</th><th></th></tr>
+      <tr><td><code>logger()</code></td><td>Prints a line for each request: address, method, path, status, size and time.</td></tr>
+      <tr><td><code>cors(origins:, methods:, headers:, credentials:, maxAge:)</code></td><td>Lets pages of other sites call the server, and answers preflight requests.</td></tr>
+      <tr><td><code>basicAuth(realm:) { user, password in … }</code></td><td>Asks for a name and password; the name goes in <code>values["user"]</code>. Only over HTTPS.</td></tr>
+      <tr><td><code>sessions(secret:, cookie:, maxAge:, secure:, sameSite:)</code></td><td>Sessions in a signed cookie, two weeks from when last saved.</td></tr>
+      <tr><td><code>compress(minimum:)</code></td><td>gzip for text, HTML, CSS, JavaScript, JSON, XML and SVG, for clients that take it.</td></tr>
+      <tr><td><code>securityHeaders(contentSecurityPolicy:)</code></td><td><code>nosniff</code>, no framing, a strict referrer policy, and a CSP if given.</td></tr>
+      <tr><td><code>bodyLimit(bytes)</code></td><td>A 413 for bigger bodies.</td></tr>
+      <tr><td><code>onRequest</code>, <code>onResponse</code>, <code>Middleware(before:, after:)</code></td><td>Middleware of your own.</td></tr>
+    </table></div>
+    <p class="intro" style="margin-top:14px"><code>web.sign</code>, <code>web.unsign</code> and <code>web.hmac</code> sign values of your own.</p>
+
+    <h3>Template tags</h3>
+    <div class="table"><table>
+      <tr><th>Tag</th><th></th></tr>
+      <tr><td><code>{{name}}</code></td><td>A value, with HTML's special characters escaped.</td></tr>
+      <tr><td><code>{{{html}}}</code>, <code>{{&amp; html}}</code></td><td>A value as it is.</td></tr>
+      <tr><td><code>{{user.name}}</code>, <code>{{items.0}}</code>, <code>{{items.count}}</code></td><td>A field, an item, a count.</td></tr>
+      <tr><td><code>{{#if x}} … {{else if y}} … {{else}} … {{/if}}</code></td><td>False, <code>nil</code>, 0, <code>""</code> and an empty list are false.</td></tr>
+      <tr><td><code>{{#unless x}} … {{/unless}}</code></td><td>The opposite.</td></tr>
+      <tr><td><code>{{#each items}} … {{else}} … {{/each}}</code></td><td>Each item, with <code>{{this}}</code>, <code>{{@index}}</code>, <code>{{@first}}</code>, <code>{{@last}}</code>, <code>{{@key}}</code>.</td></tr>
+      <tr><td><code>{{#each items as |item i|}}</code></td><td>With names for the item and its index.</td></tr>
+      <tr><td><code>{{#with user}} … {{/with}}</code></td><td>Names looked up in a value.</td></tr>
+      <tr><td><code>{{&gt; row}}</code>, <code>{{&gt; row item}}</code></td><td>Another template, with the same value or another.</td></tr>
+      <tr><td><code>{{! note }}</code>, <code>{{!-- note --}}</code></td><td>A comment.</td></tr>
+      <tr><td><code>{{~name~}}</code></td><td>Takes away the spaces and line breaks on that side.</td></tr>
+      <tr><td><code>{{@root.title}}</code>, <code>../name</code></td><td>A name from the top, or one level out.</td></tr>
+      <tr><td><code>\{{name}}</code></td><td>The text <code>{{name}}</code>.</td></tr>
+    </table></div>
+    <p class="intro" style="margin-top:14px">There are no helpers: work such values out in Tessel and pass them in. <code>web.loadTemplates(folder, extension:)</code> reads a folder and its subfolders; <code>web.parseTemplates(["name": text])</code> makes templates from texts. In a Tessel string, <code>{</code> starts a value, so a template written in the code is <code>"\{\{name}}"</code>.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>web · MIT licence · © 2026 <a href="https://syncster.dev" rel="author">Alexius Academia</a> · <a href="mailto:admin@syncster.dev">admin@syncster.dev</a> · <a href="https://syncster.dev">syncster.dev</a></span>
+    <nav>
+      <a href="https://github.com/alexiusacademia/web">GitHub</a>
+      <a href="https://tessel-packages.syncster.dev/web/">Package</a>
+      <a href="https://tessel-lang.syncster.dev">Tessel</a>
+      <a href="https://tessel-lang.syncster.dev/guides/libraries/">Libraries guide</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+// Colours the Tessel code (keywords, strings with their {values}, numbers,
+// comments), HTTP exchanges (commands, status lines, header names) and
+// template tags.
+(function () {
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const span = (cls, s) => '<span class="' + cls + '">' + esc(s) + "</span>";
+  const keywords = /^(import|fn|var|let|if|else|for|in|while|return|match|try|true|false|nil|struct|test|public)$/;
+
+  // The end of a string starting at i, skipping {values} with strings inside.
+  function stringEnd(text, i) {
+    let depth = 0;
+    for (i++; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === "\\") { i++; continue; }
+      if (depth > 0 && ch === '"') { i = stringEnd(text, i) - 1; continue; }
+      if (ch === "{") depth++;
+      else if (ch === "}" && depth > 0) depth--;
+      else if (ch === '"' && depth === 0) return i + 1;
+    }
+    return text.length;
+  }
+
+  for (const pre of document.querySelectorAll("pre.tsl")) {
+    const text = pre.textContent;
+    let out = "", i = 0;
+    while (i < text.length) {
+      const rest = text.slice(i);
+      let m;
+      if (rest.startsWith("//")) {
+        const end = text.indexOf("\n", i) < 0 ? text.length : text.indexOf("\n", i);
+        out += span("c", text.slice(i, end)); i = end;
+      } else if (text[i] === '"') {
+        const end = stringEnd(text, i);
+        out += span("s", text.slice(i, end)); i = end;
+      } else if ((m = /^\d+(?:\.\d+)?/.exec(rest)) && !/\w/.test(text[i - 1] || "")) {
+        out += span("n", m[0]); i += m[0].length;
+      } else if ((m = /^[A-Za-z_]\w*/.exec(rest))) {
+        out += keywords.test(m[0]) ? span("k", m[0]) : esc(m[0]); i += m[0].length;
+      } else {
+        out += esc(text[i]); i++;
+      }
+    }
+    pre.innerHTML = out;
+  }
+
+  for (const pre of document.querySelectorAll("pre.http")) {
+    let inHeaders = false;
+    pre.innerHTML = pre.textContent.split("\n").map(line => {
+      if (line.startsWith("$ ")) { inHeaders = false; return span("p", line); }
+      if (/^HTTP\/1\.1 \d+/.test(line)) { inHeaders = true; return span("st", line); }
+      if (line === "") { inHeaders = false; return ""; }
+      const m = /^([A-Za-z-]+):(.*)$/.exec(line);
+      if (inHeaders && m) return span("h", m[1] + ":") + esc(m[2]);
+      return esc(line);
+    }).join("\n");
+  }
+
+  for (const pre of document.querySelectorAll("pre.hbs")) {
+    const text = pre.textContent;
+    let out = "", last = 0, m;
+    const tag = /\{\{\{?[^}]*\}?\}\}|<[^>]*>/g;
+    while ((m = tag.exec(text))) {
+      out += esc(text.slice(last, m.index));
+      out += span(m[0][0] === "{" ? "t" : "g", m[0]);
+      last = tag.lastIndex;
+    }
+    pre.innerHTML = out + esc(text.slice(last));
+  }
+
+  for (const b of document.querySelectorAll("[data-copy]")) {
+    b.addEventListener("click", () => {
+      navigator.clipboard.writeText(b.dataset.copy).then(() => {
+        b.textContent = "Copied";
+        setTimeout(() => { b.textContent = "Copy"; }, 1500);
+      }, () => {});
+    });
+  }
+})();
+</script>
+</body>
+</html>

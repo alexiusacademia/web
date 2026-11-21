@@ -562,7 +562,8 @@ fn templates(_ t: Tally) -> Tally {
 
     // Errors, with lines.
     let bad = [
-        ("\{\{#if a}}\nx", "t: \{\{#if}} isn't closed with \{\{/if}}"),
+        ("\{\{#if a}}\nx", "t line 1: \{\{#if}} isn't closed with \{\{/if}}"),
+        ("a\n\{\{#if a}}\{\{else if b}}\{\{#each c}}\{\{/each}}", "t line 2: \{\{#if}} isn't closed with \{\{/if}}"),
         ("a\n\n\{\{#if a}}x\{\{/each}}", "t line 3: \{\{/each}} closes \{\{#if}} from line 3"),
         ("x\{\{/if}}", "t line 1: \{\{/if}} has no block to end"),
         ("\{\{else}}", "t line 1: \{\{else}} has no block to end"),

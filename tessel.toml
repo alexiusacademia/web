@@ -7,6 +7,6 @@ tessel = "0.23.1"
 # `tessel add web`, then `import web`.
 [library]
 name = "web"
-version = "0.1.0"
+version = "0.1.1"
 description = "Web servers: routes, middleware, forms, cookies, sessions, static files and HTML templates"
 license = "MIT"

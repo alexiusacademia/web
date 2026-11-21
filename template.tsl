@@ -173,7 +173,7 @@ fn parseTemplate(_ text: String, _ name: String) -> Result<[Node]> {
     var at = 0
     var nodes: [Node] = []
     var ending = ""
-    if let e = parseNodes(tokens, at, name, "", nodes, ending) {
+    if let e = parseNodes(tokens, at, name, "", 0, nodes, ending) {
         return Result.failure(error: e)
     }
     Result.ok(value: nodes)
@@ -415,7 +415,7 @@ fn isStandalone(_ tokens: [Token], _ i: Int) -> Bool {
 
 // Reads nodes from tokens[at] until a close or else tag (which ends the
 // block being read, `open`), and leaves `at` on that tag.
-fn parseNodes(_ tokens: [Token], _ at: bind Int, _ name: String, _ open: String,
+fn parseNodes(_ tokens: [Token], _ at: bind Int, _ name: String, _ open: String, _ openLine: Int,
               _ nodes: bind [Node], _ ending: bind String) -> Error? {
     while at < tokens.count {
         let t = tokens[at]
@@ -461,7 +461,7 @@ fn parseNodes(_ tokens: [Token], _ at: bind Int, _ name: String, _ open: String,
         }
     }
     if !open.isEmpty {
-        return Error("{name}: \{\{#{open}}} isn't closed with \{\{/{open}}}")
+        return Error("{name} line {openLine}: \{\{#{open}}} isn't closed with \{\{/{open}}}")
     }
     nil
 }
@@ -494,7 +494,7 @@ fn parseBlock(_ tokens: [Token], _ at: bind Int, _ name: String, _ head: String,
     at += 1
     var body: [Node] = []
     var ending = ""
-    if let e = parseNodes(tokens, at, name, kind, body, ending) {
+    if let e = parseNodes(tokens, at, name, kind, line, body, ending) {
         return e
     }
     var otherwise: [Node] = []
@@ -508,7 +508,7 @@ fn parseBlock(_ tokens: [Token], _ at: bind Int, _ name: String, _ head: String,
                 return Error("{name} line {elseTag.line}: can't read \{\{else {elseTag.text}}}")
             }
             var nested: [Node] = []
-            if let e = parseElseIf(tokens, at, name, inner[0], inner[1], kind, nested) {
+            if let e = parseElseIf(tokens, at, name, inner[0], inner[1], kind, line, nested) {
                 return e
             }
             otherwise = nested
@@ -516,7 +516,7 @@ fn parseBlock(_ tokens: [Token], _ at: bind Int, _ name: String, _ head: String,
             return nil
         }
         at += 1
-        if let e = parseNodes(tokens, at, name, kind, otherwise, ending) {
+        if let e = parseNodes(tokens, at, name, kind, line, otherwise, ending) {
             return e
         }
         if ending == "else" {
@@ -536,11 +536,11 @@ fn parseBlock(_ tokens: [Token], _ at: bind Int, _ name: String, _ head: String,
 // Reads `{{else if x}}…` up to the outer block's closing tag, as a block of
 // its own.
 fn parseElseIf(_ tokens: [Token], _ at: bind Int, _ name: String, _ kind: String, _ path: String,
-               _ outer: String, _ nodes: bind [Node]) -> Error? {
+               _ outer: String, _ outerLine: Int, _ nodes: bind [Node]) -> Error? {
     at += 1
     var body: [Node] = []
     var ending = ""
-    if let e = parseNodes(tokens, at, name, outer, body, ending) {
+    if let e = parseNodes(tokens, at, name, outer, outerLine, body, ending) {
         return e
     }
     var otherwise: [Node] = []
@@ -551,14 +551,14 @@ fn parseElseIf(_ tokens: [Token], _ at: bind Int, _ name: String, _ kind: String
             if inner.count != 2 || (inner[0] != "if" && inner[0] != "unless") {
                 return Error("{name} line {elseTag.line}: can't read \{\{else {elseTag.text}}}")
             }
-            if let e = parseElseIf(tokens, at, name, inner[0], inner[1], outer, otherwise) {
+            if let e = parseElseIf(tokens, at, name, inner[0], inner[1], outer, outerLine, otherwise) {
                 return e
             }
             nodes.append(Node.block(kind: kind, path: path, names: [], body: body, otherwise: otherwise))
             return nil
         }
         at += 1
-        if let e = parseNodes(tokens, at, name, outer, otherwise, ending) {
+        if let e = parseNodes(tokens, at, name, outer, outerLine, otherwise, ending) {
             return e
         }
         if ending == "else" {
