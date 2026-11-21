@@ -501,6 +501,172 @@ fn files(_ t: Tally) -> Tally {
     t2
 }
 
+fn security(_ t: Tally) -> Tally {
+    var t2 = t
+    // PBKDF2-HMAC-SHA256, RFC 7914 section 11.
+    t2.same("pbkdf2 rfc7914 1", web.pbkdf2(password: Data(text: "passwd"), salt: Data(text: "salt"), iterations: 1, length: 64).hex,
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783")
+    t2.same("pbkdf2 rfc7914 2", web.pbkdf2(password: Data(text: "Password"), salt: Data(text: "NaCl"), iterations: 80000, length: 64).hex,
+            "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d")
+    // Hashes made by Python's hashlib in Django's form.
+    t2.check("python hash", web.checkPassword("correct horse", "pbkdf2_sha256$1000$abcdefghijklmnopqrstuv$3sV/SVfT6ME4dIgYVdSlH0jEvyK0z+y3AJvov9Y+8MA="))
+    t2.check("python hash wrong", !web.checkPassword("correct horsE", "pbkdf2_sha256$1000$abcdefghijklmnopqrstuv$3sV/SVfT6ME4dIgYVdSlH0jEvyK0z+y3AJvov9Y+8MA="))
+    t2.check("python hash unicode", web.checkPassword("pässwörd ✓", "pbkdf2_sha256$5$Xy12$xKOA1ehhLqlXYK+exFyBYQpIFPhxAMjJN/gJEAQVQoM="))
+    let made = web.hashPassword("s3cret", iterations: 1000)
+    let parts = made.split("$")
+    t2.check("hash form", parts.count == 4 && parts[0] == "pbkdf2_sha256" && parts[1] == "1000" && parts[2].count == 22)
+    t2.check("hash checks", web.checkPassword("s3cret", made))
+    t2.check("hash refuses", !web.checkPassword("s3cret ", made))
+    t2.check("salted", web.hashPassword("s3cret", iterations: 1000) != made)
+    for bad in ["", "md5$1$a$b", "pbkdf2_sha256$x$a$b", "pbkdf2_sha256$0$a$b", "pbkdf2_sha256$1000$a"] {
+        t2.check("bad hash {bad}", !web.checkPassword("s3cret", bad))
+    }
+    let started = now()
+    let full = web.hashPassword("s3cret")
+    t2.check("600,000 rounds", full.hasPrefix("pbkdf2_sha256$600000$") && web.checkPassword("s3cret", full))
+    print("(two 600,000-round hashes took {(now() - started).formatted(decimals: 2)} s)")
+
+    let a = web.randomToken()
+    t2.number("token length", a.count, 43)
+    t2.check("tokens differ", a != web.randomToken())
+    t2.check("token is URL-safe", !a.contains("+") && !a.contains("/") && !a.contains("="))
+    t2.number("short token", web.randomToken(bytes: 3).count, 4)
+
+    // CSRF.
+    var forms = web.Router()
+    forms.use(web.csrf(secret: "a csrf secret, sixteen or more"))
+    forms.get("/form") { r in web.html("<form>{web.csrfField(r)}</form>") }
+    forms.post("/save") { r in web.text("saved") }
+    let page = ask(forms, "GET", "/form")
+    t2.number("csrf cookie", page.cookies.count, 1)
+    let line = if page.cookies.isEmpty { "" } else { page.cookies[0] }
+    let cookie = line.substring(from: 5, to: line.find(";") ?? line.count)
+    let token = cookie.substring(from: 0, to: cookie.findLast(".") ?? 0)
+    t2.same("csrf field", page.text(), "<form><input type&#x3D;\"hidden\"".replace("&#x3D;", with: "=") + " name=\"_csrf\" value=\"{token}\"></form>")
+    let form = ["Content-Type": "application/x-www-form-urlencoded", "Cookie": "csrf={cookie}"]
+    t2.number("csrf missing", ask(forms, "POST", "/save", body: "a=1", headers: form).status, 403)
+    t2.same("csrf field ok", ask(forms, "POST", "/save", body: "a=1&_csrf={token}", headers: form).text(), "saved")
+    t2.same("csrf header ok", ask(forms, "POST", "/save", headers: ["Cookie": "csrf={cookie}", "X-CSRF-Token": token]).text(), "saved")
+    t2.number("csrf wrong", ask(forms, "POST", "/save", body: "_csrf={token}x", headers: form).status, 403)
+    t2.number("csrf no cookie", ask(forms, "POST", "/save", body: "_csrf={token}", headers: ["Content-Type": "application/x-www-form-urlencoded"]).status, 403)
+    t2.number("csrf forged cookie", ask(forms, "POST", "/save", body: "_csrf=abc",
+                                        headers: ["Content-Type": "application/x-www-form-urlencoded", "Cookie": "csrf=abc.def"]).status, 403)
+    t2.number("csrf kept", ask(forms, "GET", "/form", headers: ["Cookie": "csrf={cookie}"]).cookies.count, 0)
+
+    // Rate limits.
+    var limited = web.Router()
+    limited.use(web.rateLimit(requests: 3, seconds: 60))
+    limited.get("/") { r in web.text("ok") }
+    let first = ask(limited, "GET", "/")
+    t2.same("limit headers", "{first.header("ratelimit-limit") ?? ""} {first.header("ratelimit-remaining") ?? ""}", "3 2")
+    let middle = [ask(limited, "GET", "/").status, ask(limited, "GET", "/").status]
+    t2.same("under the limit", toJson(middle), "[200,200]")
+    let refused = ask(limited, "GET", "/")
+    t2.number("429", refused.status, 429)
+    t2.check("retry after", (Int(refused.header("retry-after") ?? "") ?? 0) > 0)
+    var other = web.Request(path: "/", remote: "10.0.0.9:5555")
+    var otherAnswer = 0
+    limited.handle(other) { res in otherAnswer = res.status }
+    t2.number("another client", otherAnswer, 200)
+    var keyed = web.Router()
+    keyed.use(web.rateLimit(requests: 1, seconds: 60, key: { r in r.header("x-api-key") ?? "" }))
+    keyed.get("/") { r in web.text("ok") }
+    t2.number("by key first", ask(keyed, "GET", "/", headers: ["X-Api-Key": "a"]).status, 200)
+    t2.number("by key", ask(keyed, "GET", "/", headers: ["X-Api-Key": "b"]).status, 200)
+    t2.number("by key again", ask(keyed, "GET", "/", headers: ["X-Api-Key": "a"]).status, 429)
+
+    // Proxies.
+    var behind = web.Router()
+    behind.use(web.proxy(trusted: ["127.0.0.1", "10.0.0.2"]))
+    behind.get("/") { r in web.text("{r.ip} {r.secure}") }
+    var seen = ""
+    let through = web.Request(path: "/", headers: ["x-forwarded-for": "203.0.113.7, 10.0.0.2", "x-forwarded-proto": "https"], remote: "127.0.0.1:4000")
+    behind.handle(through) { res in seen = res.text() }
+    t2.same("proxy", seen, "203.0.113.7 true")
+    let spoof = web.Request(path: "/", headers: ["x-forwarded-for": "1.1.1.1", "x-forwarded-proto": "https"], remote: "198.51.100.4:4000")
+    behind.handle(spoof) { res in seen = res.text() }
+    t2.same("untrusted proxy", seen, "198.51.100.4 false")
+    let lying = web.Request(path: "/", headers: ["x-forwarded-for": "6.6.6.6, 203.0.113.7"], remote: "127.0.0.1:1")
+    behind.handle(lying) { res in seen = res.text() }
+    t2.same("client can't choose", seen, "203.0.113.7 false")
+    let six = web.Request(path: "/", remote: "[::1]:80")
+    var plain = web.Router()
+    plain.get("/") { r in web.text(r.ip) }
+    plain.handle(six) { res in seen = res.text() }
+    t2.same("ipv6 remote", seen, "::1")
+    t2
+}
+
+fn stores(_ t: Tally) -> Tally {
+    var t2 = t
+    let store = web.memoryStore()
+    var router = web.Router()
+    router.use(web.sessions(secret: "a secret of at least sixteen characters", store: store))
+    router.post("/login") { r in web.text("in").withSession(["user": r.queryValue("user") ?? ""]) }
+    router.post("/touch") { r in
+        var s = r.session
+        s["n"] = "{(Int(s["n"] ?? "0") ?? 0) + 1}"
+        web.text("n={s["n"] ?? ""}").withSession(s)
+    }
+    router.get("/") { r in web.text("user={r.session["user"] ?? "none"}") }
+    router.post("/logout") { r in web.text("out").withSession([:]) }
+    let login = ask(router, "POST", "/login?user=ann")
+    let c1 = if login.cookies.isEmpty { "" } else { login.cookies[0].substring(from: 8, to: login.cookies[0].find(";") ?? 8) }
+    t2.check("store cookie holds an id", c1.count < 120 && !c1.contains("ann"))
+    t2.number("one session", store.count(), 1)
+    t2.same("store read", ask(router, "GET", "/", headers: ["Cookie": "session={c1}"]).text(), "user=ann")
+    let touched = ask(router, "POST", "/touch", headers: ["Cookie": "session={c1}"])
+    let c2 = if touched.cookies.isEmpty { "" } else { touched.cookies[0].substring(from: 8, to: touched.cookies[0].find(";") ?? 8) }
+    t2.check("new id on save", !c2.isEmpty && c2 != c1)
+    t2.same("old id ended", ask(router, "GET", "/", headers: ["Cookie": "session={c1}"]).text(), "user=none")
+    t2.same("new id works", ask(router, "GET", "/", headers: ["Cookie": "session={c2}"]).text(), "user=ann")
+    t2.number("still one session", store.count(), 1)
+    let bob = ask(router, "POST", "/login?user=bob")
+    let c3 = if bob.cookies.isEmpty { "" } else { bob.cookies[0].substring(from: 8, to: bob.cookies[0].find(";") ?? 8) }
+    t2.number("ended by the server", store.removeWhere({ s in s["user"] == "ann" }), 1)
+    t2.same("ann signed out", ask(router, "GET", "/", headers: ["Cookie": "session={c2}"]).text(), "user=none")
+    t2.same("bob still in", ask(router, "GET", "/", headers: ["Cookie": "session={c3}"]).text(), "user=bob")
+    let out = ask(router, "POST", "/logout", headers: ["Cookie": "session={c3}"])
+    t2.check("logout clears", out.cookies.count == 1 && out.cookies[0].hasPrefix("session=; Max-Age=0"))
+    t2.number("no sessions", store.count(), 0)
+    t2.same("unsigned id refused", ask(router, "GET", "/", headers: ["Cookie": "session={c3.substring(from: 0, to: c3.findLast(".") ?? 0)}"]).text(), "user=none")
+
+    // In a database: a second store on the same file finds the session.
+    let path = "tests/sessions-test.db"
+    deleteFile(path)
+    match web.databaseStore(path) {
+        .ok(db) -> {
+            db.save("abc", web.StoredSession(values: ["user": "ann", "note": "a \"quoted\" one"], expires: now() + 60))
+            db.save("old", web.StoredSession(values: ["user": "zed"], expires: now() - 1))
+            t2.number("db count", db.count(), 1)
+            match web.databaseStore(path) {
+                .ok(again) -> {
+                    let kept = again.load("abc") ?? web.StoredSession(values: [:], expires: 0)
+                    t2.same("db kept", kept.values["note"] ?? "", "a \"quoted\" one")
+                    t2.check("db missing", again.load("nope") == nil)
+                    t2.number("db removeWhere", again.removeWhere({ s in s["user"] == "ann" }), 1)
+                    t2.check("db removed", db.load("abc") == nil)
+                }
+                .failure(e) -> t2.check(e.message, false)
+            }
+            var site = web.Router()
+            site.use(web.sessions(secret: "a secret of at least sixteen characters", store: db))
+            site.post("/login") { r in web.text("in").withSession(["user": "cy"]) }
+            site.get("/") { r in web.text("user={r.session["user"] ?? "none"}") }
+            let l = ask(site, "POST", "/login")
+            let c = if l.cookies.isEmpty { "" } else { l.cookies[0].substring(from: 8, to: l.cookies[0].find(";") ?? 8) }
+            t2.same("db sessions", ask(site, "GET", "/", headers: ["Cookie": "session={c}"]).text(), "user=cy")
+        }
+        .failure(e) -> t2.check("database store: {e.message}", false)
+    }
+    deleteFile(path)
+    match web.databaseStore(":memory:", table: "bad name") {
+        .ok(_) -> t2.check("bad table refused", false)
+        .failure(e) -> t2.same("bad table", e.message, "\"bad name\" can't be a table name: use letters, digits and _")
+    }
+    t2
+}
+
 // The file of Handlebars cases.
 struct OracleFile {
     data: String
@@ -649,6 +815,8 @@ fn main() {
     t = sessions(t)
     t = files(t)
     t = templates(t)
+    t = security(t)
+    t = stores(t)
 
     // A route that answers later.
     var router = web.Router()
@@ -686,7 +854,12 @@ fn main() {
                     t.number("served range", part.status, 206)
                     t.number("served range bytes", part.data.count, 3)
                     stopHTTP(server)
-                    finish(t)
+                    web.hashPasswordLater("later", iterations: 2000) { hash in
+                        web.checkPasswordLater("later", hash) { ok in
+                            t.check("passwords on another thread", ok && hash.hasPrefix("pbkdf2_sha256$2000$"))
+                            finish(t)
+                        }
+                    }
                 }
             }
         }

@@ -160,6 +160,9 @@ public struct Router {
         var req = request
         req.method = req.method.uppercase()
         req.path = normalizedPath(req.path)
+        if req.ip.isEmpty {
+            req.ip = hostOnly(req.remote)
+        }
         if req.received == 0 {
             req.received = now()
         }

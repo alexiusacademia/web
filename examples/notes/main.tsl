@@ -1,9 +1,12 @@
 // An example of web: a small notes site. Pages from templates with a
 // layout, a form that adds notes, a JSON API, a stylesheet from a folder,
-// and signing in with a session. Notes are kept in memory.
+// and signing in: hashed passwords checked on another thread, server-side
+// sessions, CSRF tokens in the forms, and a limit on sign-in attempts.
+// Notes are kept in memory.
 //
 // Run it from the library's folder: `tessel run examples/notes`, then
-// open http://127.0.0.1:8080/ (the password is "tessel").
+// open http://127.0.0.1:8080/ and sign in as "ann" with the password
+// "tessel". Set NOTES_SECRET to a long random text for a real server.
 //
 // Author: Alexius Academia
 // Date: 2026-11-21
@@ -20,26 +23,35 @@ struct HomePage {
     title: String
     user: String
     notes: [Note]
+    csrf: String
     error: String = ""
 }
 
 fn main() {
+    let secret = environment("NOTES_SECRET") ?? "change me: a long random text"
     let pages = try web.loadTemplates(joinPath(appFolder(), "views"))
     var notes = [Note(id: 1, text: "Try adding a note", author: "web")]
     var nextId = 2
+    // Names and password hashes; a real site keeps them in a database.
+    let users = ["ann": web.hashPassword("tessel")]
+    let sessions = web.memoryStore()
 
     var router = web.Router()
+    router.use(web.proxy())
     router.use(web.logger())
     router.use(web.securityHeaders())
-    router.use(web.sessions(secret: environment("NOTES_SECRET") ?? "change me: a long random text"))
+    router.use(web.sessions(secret: secret, store: sessions))
     router.files("/static", folder: joinPath(appFolder(), "public"))
 
-    router.get("/") { r in
-        let user = r.session["user"] ?? ""
-        web.page(pages, "home", HomePage(title: "Notes", user: user, notes: notes.reversed(),
-                                        error: r.queryValue("error") ?? ""), layout: "layout")
+    // The pages and their forms, with CSRF tokens.
+    var site = web.Router()
+    site.use(web.csrf(secret: secret))
+    site.get("/") { r in
+        let page = HomePage(title: "Notes", user: r.session["user"] ?? "", notes: notes.reversed(),
+                            csrf: web.csrfField(r), error: r.queryValue("error") ?? "")
+        web.page(pages, "home", page, layout: "layout")
     }
-    router.post("/notes") { r in
+    site.post("/notes") { r in
         let user = r.session["user"] ?? ""
         let text = (r.form()["text"] ?? "").trim()
         if user.isEmpty {
@@ -52,17 +64,28 @@ fn main() {
         nextId += 1
         web.redirect("/", status: 303)
     }
-    router.post("/login") { r in
-        let form = r.form()
-        let name = (form["name"] ?? "").trim()
-        if name.isEmpty || form["password"] != "tessel" {
-            return web.redirect("/?error=Wrong+password", status: 303)
-        }
-        web.redirect("/", status: 303).withSession(["user": name])
-    }
-    router.post("/logout") { r in
+    site.post("/logout") { r in
         web.redirect("/", status: 303).withSession([:])
     }
+
+    // Signing in: at most 5 tries a minute from one address, and the
+    // password is checked on another thread so other requests go on.
+    var login = web.Router()
+    login.use(web.rateLimit(requests: 5, seconds: 60))
+    login.later("POST", "/login") { r, reply in
+        let form = r.form()
+        let name = (form["name"] ?? "").trim()
+        let hash = users[name] ?? "none"
+        web.checkPasswordLater(form["password"] ?? "", hash) { ok in
+            if ok {
+                reply(web.redirect("/", status: 303).withSession(["user": name]))
+            } else {
+                reply(web.redirect("/?error=Wrong+name+or+password", status: 303))
+            }
+        }
+    }
+    site.mount("", login)
+    router.mount("", site)
 
     // The same notes as JSON, for programs.
     var api = web.Router()

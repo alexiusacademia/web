@@ -10,7 +10,7 @@
 public fn logger() -> Middleware {
     onResponse { request, response in
         let ms = (now() - request.received) * 1000
-        let host = request.remote.substring(from: 0, to: request.remote.findLast(":") ?? request.remote.count)
+        let host = if request.ip.isEmpty { hostOnly(request.remote) } else { request.ip }
         let target = if request.query.isEmpty { request.path } else { request.path + "?" + request.query }
         print("{host} {request.method} {target} {response.status} {response.body.count} B {ms.formatted(decimals: 2)} ms")
         response
@@ -200,14 +200,22 @@ public fn bodyLimit(_ bytes: Int) -> Middleware {
     }
 }
 
-// Sessions kept in a signed cookie: handlers read `request.session` and
-// save it with `response.withSession(…)`. The cookie holds the values
-// themselves (readable by the user, but not changeable without `secret`),
-// so keep them small (a browser takes about 4 KB) and never put secrets
-// in them. `secret` should be long and random, and kept out of the code;
-// changing it ends every session. `maxAge` is in seconds.
+// Sessions: handlers read `request.session` and save it with
+// `response.withSession(…)` (an empty dictionary ends it).
+//
+// Without a `store`, the cookie holds the values themselves, signed:
+// readable by the user but not changeable without `secret`. Keep them
+// small (a browser takes about 4 KB) and never put secrets in them.
+//
+// With a `store` (`web.memoryStore()`, `web.databaseStore(…)`), the
+// values stay on the server and the cookie holds only a signed random
+// id, which changes each time the session is saved. Sessions can then
+// be ended from the server: `store.removeWhere { s in s["user"] == "ann" }`.
+//
+// `secret` should be long and random, and kept out of the code; changing
+// it ends every session. `maxAge` is in seconds.
 public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 1209600,
-                   secure: Bool = false, sameSite: String = "Lax") -> Middleware {
+                   secure: Bool = false, sameSite: String = "Lax", store: SessionStore? = nil) -> Middleware {
     if secret.count < 16 {
         print("web: a session secret must be at least 16 characters")
         exit(1)
@@ -219,8 +227,17 @@ public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 120
         var passed = request
         if let raw = request.cookie(cookie) {
             if let payload = unsign(raw, secret: key) {
-                if let bytes = decodeBase64(fromBase64Url(payload)) {
-                    let saved: SavedSession? = fromJson(bytes.text ?? "")
+                if let s = store {
+                    if let saved = s.load(payload) {
+                        if saved.expires > now() {
+                            passed.session = saved.values
+                            passed.values["web.session.id"] = payload
+                        } else {
+                            s.remove(payload)
+                        }
+                    }
+                } else if let bytes = decodeBase64(fromBase64Url(payload)) {
+                    let saved: StoredSession? = fromJson(bytes.text ?? "")
                     if let s = saved {
                         if s.expires > now() {
                             passed.session = s.values
@@ -234,22 +251,32 @@ public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 120
         if let values = response.session {
             var r = response
             r.session = nil
+            let oldId = request.values["web.session.id"] ?? ""
+            if let s = store {
+                if !oldId.isEmpty {
+                    s.remove(oldId)
+                }
+            }
             if values.isEmpty {
                 if request.cookie(cookie) == nil {
                     return r
                 }
                 return r.withoutCookie(cookie)
             }
-            let saved = SavedSession(values: values, expires: now() + Float(maxAge))
-            let payload = toBase64Url(Data(text: toJson(saved)).base64)
+            let expires = now() + Float(maxAge)
+            var payload = ""
+            if let s = store {
+                // A new id each time, so an id known before signing in is
+                // worth nothing after.
+                payload = randomToken(secret: key)
+                s.save(payload, StoredSession(values: values, expires: expires))
+            } else {
+                payload = toBase64Url(Data(text: toJson(StoredSession(values: values, expires: expires))).base64)
+            }
             return r.withCookie(cookie, sign(payload, secret: key), maxAge: maxAge, secure: secure, sameSite: sameSite)
         }
         response
     })
 }
 
-// A session as its cookie holds it.
-struct SavedSession {
-    values: [String: String]
-    expires: Float
-}
+

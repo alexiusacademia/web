@@ -21,8 +21,14 @@ public struct Request {
     // The headers, with names in lowercase.
     headers: [String: String] = [:]
     body: Data = Data()
-    // The client's "ip:port".
+    // The client's "ip:port", as the connection came.
     remote: String = ""
+    // The client's IP address: from `remote`, or from X-Forwarded-For
+    // with the `proxy` middleware.
+    ip: String = ""
+    // Whether the client used HTTPS (with the `proxy` middleware, behind
+    // a proxy that does HTTPS).
+    secure: Bool = false
     // The parts of the path a route named, decoded: `/users/:id` gives "id".
     params: [String: String] = [:]
     // Notes left by middleware for the handler, like the signed-in user.

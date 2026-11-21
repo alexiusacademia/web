@@ -1,0 +1,287 @@
+// web: secrets and safety: random tokens, password hashes (PBKDF2), CSRF
+// tokens for forms, limits on how often a client may ask, and the
+// client's real address behind a proxy.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// ---- Random tokens ----
+
+// `count` random bytes for secrets. On macOS, Linux and Android they come
+// from the system (/dev/urandom). Tessel has no such source on Windows
+// yet (tessel#84), so there they're HMAC-SHA256, keyed with `secret`,
+// over the time and Tessel's `random`: as good as `secret` is long and
+// random.
+fn secureBytes(_ count: Int, _ secret: String) -> Data {
+    if platform() != "windows" {
+        if let bytes = readData("/dev/urandom", from: 0, count: count) {
+            if bytes.count == count {
+                return bytes
+            }
+        }
+    }
+    var out = Data()
+    var block = 0
+    while out.count < count {
+        let seed = "{now()}:{block}:{random(0..2147483647)}:{random(0..2147483647)}:{randomFloat()}"
+        out += hmac(key: Data(text: secret + ":web random"), message: Data(text: seed))
+        block += 1
+    }
+    out.slice(from: 0, to: count)
+}
+
+// A random token for a secret link, a key or an id: `bytes` random bytes
+// as URL-safe base64 (32 bytes give 43 characters). On Windows, pass a
+// long random `secret` of your own (see `secureBytes`).
+public fn randomToken(bytes: Int = 32, secret: String = "") -> String {
+    toBase64Url(secureBytes(bytes, secret).base64)
+}
+
+// ---- Passwords ----
+
+// PBKDF2 with HMAC-SHA256 (RFC 8018): `length` bytes derived from a
+// password and a salt, by `iterations` rounds.
+public fn pbkdf2(password: Data, salt: Data, iterations: Int, length: Int = 32) -> Data {
+    var k = if password.count > 64 { password.hash() } else { password }
+    while k.count < 64 {
+        k.append(byte: 0)
+    }
+    var inner = Data()
+    var outer = Data()
+    for i in 0..64 {
+        inner.append(byte: k[i] ^ 0x36)
+        outer.append(byte: k[i] ^ 0x5c)
+    }
+    var out = Data()
+    var block = 1
+    while out.count < length {
+        var first = salt
+        first += Data(bytes: [(block >> 24) & 255, (block >> 16) & 255, (block >> 8) & 255, block & 255])
+        var u = (outer + (inner + first).hash()).hash()
+        var t = u.bytes
+        var n = 1
+        while n < iterations {
+            u = (outer + (inner + u).hash()).hash()
+            for j in 0..32 {
+                t[j] = t[j] ^ u[j]
+            }
+            n += 1
+        }
+        out += Data(bytes: t)
+        block += 1
+    }
+    out.slice(from: 0, to: length)
+}
+
+// A password's hash to store, in Django's form:
+// "pbkdf2_sha256$600000$salt$hash". The salt is new each time, so the
+// same password gives a different hash. 600,000 rounds take about half a
+// second; on a busy server, use `hashPasswordLater`.
+public fn hashPassword(_ password: String, iterations: Int = 600000) -> String {
+    let salt = randomToken(bytes: 16).replace("-", with: "a").replace("_", with: "b").substring(from: 0, to: 22)
+    let derived = pbkdf2(password: Data(text: password), salt: Data(text: salt), iterations: iterations)
+    "pbkdf2_sha256${iterations}${salt}${derived.base64}"
+}
+
+// Whether `password` is the one `hash` was made from (by `hashPassword`,
+// or Django's pbkdf2_sha256). A hash in another form is false.
+public fn checkPassword(_ password: String, _ hash: String) -> Bool {
+    let parts = hash.split("$")
+    if parts.count != 4 || parts[0] != "pbkdf2_sha256" {
+        return false
+    }
+    if let iterations = Int(parts[1]) {
+        if iterations < 1 || iterations > 100000000 {
+            return false
+        }
+        let derived = pbkdf2(password: Data(text: password), salt: Data(text: parts[2]), iterations: iterations)
+        return sameText(derived.base64, parts[3])
+    }
+    false
+}
+
+// `hashPassword` on another thread, so other requests aren't held up;
+// `done` gets the hash.
+public fn hashPasswordLater(_ password: String, iterations: Int = 600000, done: fn(String)) {
+    background(work: { job in hashPassword(password, iterations: iterations) }) { hash in
+        done(hash)
+    }
+}
+
+// `checkPassword` on another thread; `done` gets whether it's right.
+public fn checkPasswordLater(_ password: String, _ hash: String, done: fn(Bool)) {
+    background(work: { job in checkPassword(password, hash) }) { ok in
+        done(ok)
+    }
+}
+
+// ---- CSRF ----
+
+// Stops other sites from sending forms in a signed-in user's name. Each
+// browser gets a token in a signed cookie; a POST, PUT, PATCH or DELETE
+// must send it back, as the form field `field` or the header `header`,
+// or it gets a 403. Put `web.csrfField(r)` in each form (or send
+// `web.csrfToken(r)` in the header from JavaScript). Use it on the
+// routes of pages and forms, not on an API that other programs call.
+public fn csrf(secret: String, cookie: String = "csrf", field: String = "_csrf", header: String = "x-csrf-token",
+               secure: Bool = false) -> Middleware {
+    if secret.count < 16 {
+        print("web: a CSRF secret must be at least 16 characters")
+        exit(1)
+    }
+    let key = hmac(key: Data(text: secret), message: Data(text: "web csrf")).hex
+    Middleware(before: { request in
+        var passed = request
+        var token = ""
+        var known = false
+        if let raw = request.cookie(cookie) {
+            if let t = unsign(raw, secret: key) {
+                token = t
+                known = true
+            }
+        }
+        if !known {
+            token = randomToken(secret: key)
+            passed.values["web.csrf.new"] = "1"
+        }
+        passed.values["csrf"] = token
+        let m = request.method
+        if m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE" {
+            let sent = request.header(header) ?? (request.form()[field] ?? "")
+            if !known || sent.isEmpty || !sameText(sent, token) {
+                return Step.stop(response: status(403, "The form is out of date or came from another site: reload the page and try again"))
+            }
+        }
+        Step.next(request: passed)
+    }, after: { request, response in
+        if request.values["web.csrf.new"] == "1" {
+            return response.withCookie(cookie, sign(request.values["csrf"] ?? "", secret: key), secure: secure)
+        }
+        response
+    })
+}
+
+// The CSRF token for this request (with the `csrf` middleware).
+public fn csrfToken(_ request: Request) -> String {
+    request.values["csrf"] ?? ""
+}
+
+// A hidden form field with the CSRF token, to put in a form (in a
+// template, with `{{{csrf}}}`).
+public fn csrfField(_ request: Request, field: String = "_csrf") -> String {
+    "<input type=\"hidden\" name=\"{escapeHtml(field)}\" value=\"{escapeHtml(csrfToken(request))}\">"
+}
+
+// ---- Rate limits ----
+
+// How many requests a client has made in its current window.
+struct RateWindow {
+    start: Float
+    count: Int
+}
+
+// Lets each client make at most `requests` requests every `seconds`;
+// more get a 429 with Retry-After. Clients are told apart by `key`: their
+// IP address unless you say otherwise (a user's name, an API key).
+// Answers carry RateLimit-Limit, RateLimit-Remaining and RateLimit-Reset.
+// The counts are kept in memory, for this server only.
+public fn rateLimit(requests: Int, seconds: Float, key: fn(Request) -> String = clientIP) -> Middleware {
+    var windows: [String: RateWindow] = [:]
+    var lastSweep = now()
+    Middleware(before: { request in
+        let t = now()
+        // Forget clients whose window has ended, now and then.
+        if t - lastSweep > max(seconds, 60.0) {
+            var kept: [String: RateWindow] = [:]
+            for (k, w) in windows {
+                if t - w.start < seconds {
+                    kept[k] = w
+                }
+            }
+            windows = kept
+            lastSweep = t
+        }
+        let k = key(request)
+        var w = windows[k] ?? RateWindow(start: t, count: 0)
+        if t - w.start >= seconds {
+            w = RateWindow(start: t, count: 0)
+        }
+        w.count += 1
+        windows[k] = w
+        var passed = request
+        let reset = max(Int(w.start + seconds - t + 0.999), 1)
+        passed.values["web.rate"] = "{requests},{max(requests - w.count, 0)},{reset}"
+        if w.count > requests {
+            var r = status(429)
+            r = r.withHeader("Retry-After", "{reset}")
+            r = r.withHeader("RateLimit-Limit", "{requests}")
+            r = r.withHeader("RateLimit-Remaining", "0")
+            r = r.withHeader("RateLimit-Reset", "{reset}")
+            return Step.stop(response: r)
+        }
+        Step.next(request: passed)
+    }, after: { request, response in
+        let parts = (request.values["web.rate"] ?? "").split(",")
+        if parts.count != 3 {
+            return response
+        }
+        response.withHeader("RateLimit-Limit", parts[0]).withHeader("RateLimit-Remaining", parts[1])
+            .withHeader("RateLimit-Reset", parts[2])
+    })
+}
+
+// The client's IP address: the default key for `rateLimit`.
+fn clientIP(_ request: Request) -> String {
+    request.ip
+}
+
+// ---- Proxies ----
+
+// For a server behind a proxy (Caddy, nginx) that does HTTPS: when a
+// request comes from one of the `trusted` addresses, `request.ip` becomes
+// the client's address from X-Forwarded-For, and `request.secure` says
+// whether the client used HTTPS (X-Forwarded-Proto). Put it first.
+public fn proxy(trusted: [String] = ["127.0.0.1", "::1"]) -> Middleware {
+    onRequest { request in
+        if !trusted.contains(request.ip) {
+            return Step.next(request: request)
+        }
+        var passed = request
+        // From the right: each trusted proxy added the address it got the
+        // request from; the first one that isn't a proxy is the client.
+        let forwarded = (request.header("x-forwarded-for") ?? "").split(",").map { a in a.trim() }.filter { a in !a.isEmpty }
+        var i = forwarded.count - 1
+        while i >= 0 {
+            let address = hostOnly(forwarded[i])
+            passed.ip = address
+            if !trusted.contains(address) {
+                break
+            }
+            i -= 1
+        }
+        let protos = (request.header("x-forwarded-proto") ?? "").split(",")
+        let proto = protos[protos.count - 1].trim().lowercase()
+        if proto == "https" {
+            passed.secure = true
+        } else if proto == "http" {
+            passed.secure = false
+        }
+        Step.next(request: passed)
+    }
+}
+
+// An address without its port: "1.2.3.4:80" is "1.2.3.4", "[::1]:80" is
+// "::1"; a bare IPv6 address stays as it is.
+fn hostOnly(_ address: String) -> String {
+    let a = address.trim()
+    if a.hasPrefix("[") {
+        if let close = a.find("]") {
+            return a.substring(from: 1, to: close)
+        }
+        return a
+    }
+    if a.occurrences(of: ":") == 1 {
+        return a.substring(from: 0, to: a.find(":") ?? a.count)
+    }
+    a
+}

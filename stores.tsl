@@ -1,0 +1,133 @@
+// web: where server-side sessions are kept: in memory, or in a SQLite
+// database. A store is a set of functions, so a program can make its own
+// (for another database) by filling them in.
+//
+// Author: Alexius Academia
+// Date: 2026-11-21
+
+// A session's values and when it ends (see `now()`).
+public struct StoredSession {
+    values: [String: String]
+    expires: Float
+}
+
+// Where sessions are kept, by id.
+public struct SessionStore {
+    load: fn(String) -> StoredSession?
+    save: fn(String, StoredSession)
+    remove: fn(String)
+    // Ends every session whose values pass the test, and says how many.
+    removeWhere: fn(fn([String: String]) -> Bool) -> Int
+    // The sessions there are now (ended ones aren't counted).
+    count: fn() -> Int
+}
+
+// Sessions in memory: they end when the program does.
+public fn memoryStore() -> SessionStore {
+    var items: [String: StoredSession] = [:]
+    var lastSweep = now()
+    SessionStore(load: { id in
+        items[id]
+    }, save: { id, session in
+        items[id] = session
+        // Forget ended sessions now and then.
+        let t = now()
+        if t - lastSweep > 60 {
+            var kept: [String: StoredSession] = [:]
+            for (k, s) in items {
+                if s.expires > t {
+                    kept[k] = s
+                }
+            }
+            items = kept
+            lastSweep = t
+        }
+    }, remove: { id in
+        items[id] = nil
+    }, removeWhere: { test in
+        var kept: [String: StoredSession] = [:]
+        var removed = 0
+        for (k, s) in items {
+            if test(s.values) {
+                removed += 1
+            } else {
+                kept[k] = s
+            }
+        }
+        items = kept
+        removed
+    }, count: {
+        let t = now()
+        items.values.filter({ s in s.expires > t }).count
+    })
+}
+
+// Sessions in a table of a SQLite database (made if it isn't there), so
+// they last when the server restarts. `table` is a plain name: letters,
+// digits and `_`.
+public fn databaseStore(_ path: String, table: String = "web_sessions") -> Result<SessionStore> {
+    for c in table.characters {
+        if !"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".contains(c) {
+            return Result.failure(error: Error("\"{table}\" can't be a table name: use letters, digits and _"))
+        }
+    }
+    var db = try openDatabase(path)
+    try db.execute("CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, data TEXT NOT NULL, expires REAL NOT NULL)")
+    try db.execute("DELETE FROM {table} WHERE expires < ?", [now()])
+    let store = SessionStore(load: { id in
+        match db.query("SELECT data, expires FROM {table} WHERE id = ?", [id]) {
+            .ok(rows) -> {
+                if rows.isEmpty {
+                    return nil
+                }
+                let values: [String: String]? = fromJson(rows[0].text("data"))
+                if let v = values {
+                    return StoredSession(values: v, expires: rows[0].float("expires"))
+                }
+                nil
+            }
+            .failure(e) -> {
+                printError("web: can't read a session: {e.message}")
+                nil
+            }
+        }
+    }, save: { id, session in
+        run(db, "INSERT OR REPLACE INTO {table} (id, data, expires) VALUES (?, ?, ?)",
+            [id, toJson(session.values), session.expires])
+        if random(0..100) == 0 {
+            run(db, "DELETE FROM {table} WHERE expires < ?", [now()])
+        }
+    }, remove: { id in
+        run(db, "DELETE FROM {table} WHERE id = ?", [id])
+    }, removeWhere: { test in
+        var removed = 0
+        match db.query("SELECT id, data FROM {table}") {
+            .ok(rows) -> {
+                for row in rows {
+                    let values: [String: String] = fromJson(row.text("data")) ?? [:]
+                    if test(values) {
+                        run(db, "DELETE FROM {table} WHERE id = ?", [row.text("id")])
+                        removed += 1
+                    }
+                }
+            }
+            .failure(e) -> printError("web: can't read the sessions: {e.message}")
+        }
+        removed
+    }, count: {
+        match db.query("SELECT COUNT(*) AS n FROM {table} WHERE expires > ?", [now()]) {
+            .ok(rows) -> if rows.isEmpty { 0 } else { rows[0].int("n") }
+            .failure(_) -> 0
+        }
+    })
+    Result.ok(value: store)
+}
+
+// Runs SQL that changes the database, saying on the error output if it
+// can't.
+fn run(_ db: Database, _ sql: String, _ values: [SqlValue] = []) {
+    match db.execute(sql, values) {
+        .ok(_) -> {}
+        .failure(e) -> printError("web: the session store can't save: {e.message}")
+    }
+}

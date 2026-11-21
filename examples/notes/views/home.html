@@ -4,12 +4,14 @@
 {{/if}}
 {{#if user}}
 <form method="post" action="/notes">
+  {{{csrf}}}
   <input name="text" placeholder="A note from {{user}}" autofocus>
   <button>Add</button>
 </form>
-<form method="post" action="/logout"><button class="link">Sign out {{user}}</button></form>
+<form method="post" action="/logout">{{{csrf}}}<button class="link">Sign out {{user}}</button></form>
 {{else}}
 <form method="post" action="/login">
+  {{{csrf}}}
   <input name="name" placeholder="Your name">
   <input name="password" type="password" placeholder="Password">
   <button>Sign in</button>
