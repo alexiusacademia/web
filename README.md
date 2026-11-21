@@ -109,7 +109,8 @@ A pattern's parts can be `:name` (one part of the path) or, at the end,
 `/users/ann%20lee` gives `r.param("id")` = `"ann lee"`. When several routes
 fit, fixed text wins over `:name`, and `:name` over `*name`, part by part,
 so `/users/new` goes to its own route before `/users/:id`, whatever the
-order they were added in. A trailing slash doesn't matter.
+order they were added in, and `/docs` before `/docs/*rest`. A trailing
+slash doesn't matter.
 
 A path that fits only routes of other methods gets a 405 with an `Allow`
 header, and an OPTIONS request gets the same `Allow` with a 204.
@@ -126,7 +127,7 @@ A handler gets a `web.Request`:
 
 | Field or method | |
 |---|---|
-| `method`, `path`, `query` | `"GET"`, `"/users/3"` (as sent, encoded), `"page=2"`. |
+| `method`, `path`, `query` | `"GET"`, `"/users/3"`, `"page=2"`. The path is still encoded (`%20`), but tidied as the router sees it: `//a` is `/a`, and `/%61dmin` is `/admin`, so a check in middleware like `r.path.hasPrefix("/admin")` can't be got round. |
 | `headers`, `header(name)` | Names in lowercase; `header` takes any case. |
 | `body`, `text()` | The body as `Data`, and as text. |
 | `param(name)`, `params` | Values from the pattern. |
@@ -209,8 +210,9 @@ router.post("/logout") { r in web.redirect("/", status: 303).withSession([:]) }
 ```
 
 The session's values are kept in the cookie itself, signed with HMAC-SHA256
-so they can't be changed without the secret (but they can be read: never
-put a password in them). The secret must be at least 16 characters; keep
+with a key made from the secret for sessions only, so they can't be
+changed without the secret (but they can be read: never put a password
+in them). The secret must be at least 16 characters; keep
 it out of the code, and changing it ends every session. A session lasts
 `maxAge` seconds (two weeks) from when it was last saved. `web.sign`,
 `web.unsign` and `web.hmac` are there for signing values of your own.
@@ -228,7 +230,10 @@ router.get("/report") { r in web.file("report.pdf", r, download: "Report 2026.pd
 304 and no bytes. A `Range` request gets only those bytes (206), so video
 plays and downloads resume. A folder's address sends its `index.html`
 (and `/docs` is sent to `/docs/` first). Names with `..`, encoded slashes
-and hidden files (`.env`, `.git`) aren't sent.
+and hidden files (`.env`, `.git`) aren't sent, nor on Windows device names
+(`CON`, `NUL`), short names (`GITIGN~1`) and names ending in a dot.
+Symbolic links in the folder are followed. Other methods than GET and
+HEAD get a 404.
 
 | `FileOptions` | |
 |---|---|
@@ -311,10 +316,18 @@ what Handlebars gives (checked on 3,000 templates):
 | `{{#with user}} … {{/with}}` | Names looked up in a value. |
 | `{{> row}}`, `{{> row item}}` | Another template, with the same value or another. |
 | `{{! note }}`, `{{!-- note --}}` | A comment. |
+| `{{~name~}}`, `{{~#if x}}` | `~` takes away the spaces and line breaks on that side of the tag. |
+| `{{^}}` | The same as `{{else}}`. |
+| `{{@root.title}}` | A name in the data given to the template, from anywhere. |
+| `\{{name}}` | The text `{{name}}`. |
 
 A name is looked up in the innermost value first, then outwards, so the
-page's `title` works inside `each`; `../name` starts one level out. A name
-that isn't there shows nothing. A line with only a block tag (or a
+page's `title` works inside `each`; `../name` starts one level out (this is
+Handlebars with `compat: true`, or Mustache). A name that isn't there
+shows nothing. A list shows its items with commas; numbers show as
+Tessel's `toJson` writes them (`2.0` for a `Float`). There are no helpers:
+`{{eq a b}}` is a mistake the templates report, so work such values out in
+Tessel and pass them in. A line with only a block tag (or a
 comment or partial) leaves no blank line behind.
 
 The data is any value `toJson` takes. `web.loadTemplates(folder, extension:)`

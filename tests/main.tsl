@@ -70,6 +70,7 @@ fn routing(_ t: Tally) -> Tally {
     t2.same("double slash", ask(router, "GET", "//users//7").text(), "user 7")
     t2.same("wildcard", ask(router, "GET", "/files/a/b/c.txt").text(), "rest=a/b/c.txt")
     t2.same("wildcard empty", ask(router, "GET", "/files").text(), "rest=")
+    t2.same("encoded letters", ask(router, "GET", "/%75sers/%6Eew").text(), "new form")
     t2.same("param before wildcard", ask(router, "GET", "/about").text(), "page about")
     t2.number("post", ask(router, "POST", "/users").status, 201)
     t2.same("put", ask(router, "PUT", "/users/1").text(), "put")
@@ -79,6 +80,9 @@ fn routing(_ t: Tally) -> Tally {
     t2.same("any", ask(router, "PROPFIND", "/echo").text(), "PROPFIND")
     t2.same("custom method", ask(router, "REPORT", "/report").text(), "custom method")
     t2.same("query ignored", ask(router, "GET", "/users/5?x=1").text(), "user 5")
+    router.get("/files") { r in web.text("exact files") }
+    t2.same("exact beats wildcard", ask(router, "GET", "/files").text(), "exact files")
+    t2.same("wildcard still", ask(router, "GET", "/files/x").text(), "rest=x")
 
     let head = ask(router, "HEAD", "/users/3")
     t2.check("HEAD uses GET", head.status == 200 && head.text() == "user 3")
@@ -142,12 +146,18 @@ fn middleware(_ t: Tally) -> Tally {
     }
     let hello = ask(router, "GET", "/hello")
     t2.same("value from middleware", hello.text(), "hello ann")
+    var paths = web.Router()
+    paths.any("/*rest") { r in web.text(r.path) }
+    t2.same("path normalized", ask(paths, "GET", "//a/%7Eb/%2F/c%20d/").text(), "/a/~b/%2F/c%20d/")
     t2.same("order", order.joined(separator: ", "), "before 1, before 2, handler, after 2, after 1")
     t2.same("after sees request", hello.header("X-Who") ?? "", "ann")
     order = []
     let blocked = ask(router, "GET", "/blocked")
     t2.number("stopped", blocked.status, 403)
     t2.same("stop order", order.joined(separator: ", "), "before 1, before 2, after 2, after 1")
+    order = []
+    t2.number("blocked, encoded", ask(router, "GET", "/%62locked").status, 403)
+    t2.number("blocked, slashes", ask(router, "GET", "//blocked").status, 403)
     order = []
     t2.number("middleware on 404", ask(router, "GET", "/none").status, 404)
     t2.same("404 order", order.joined(separator: ", "), "before 1, before 2, after 2, after 1")
@@ -172,6 +182,13 @@ fn middleware(_ t: Tally) -> Tally {
     t2.same("cors listed", good.header("access-control-allow-origin") ?? "", "https://good.example")
     t2.same("cors credentials", good.header("access-control-allow-credentials") ?? "", "true")
     t2.same("cors vary", good.header("vary") ?? "", "Origin")
+    t2.same("cors vary without origin", ask(some, "GET", "/data").header("vary") ?? "", "Origin")
+    var both = web.Router()
+    both.use(web.cors(origins: ["https://good.example"]))
+    both.use(web.compress(minimum: 1))
+    both.get("/") { r in web.text("hello hello hello") }
+    t2.same("vary kept", ask(both, "GET", "/", headers: ["Origin": "https://good.example", "Accept-Encoding": "gzip"]).header("vary") ?? "",
+            "Accept-Encoding, Origin")
     let bad = ask(some, "GET", "/data", headers: ["Origin": "https://bad.example"])
     t2.same("cors not listed", bad.header("access-control-allow-origin") ?? "none", "none")
     let badPre = ask(some, "OPTIONS", "/data", headers: ["Origin": "https://bad.example", "Access-Control-Request-Method": "GET"])
@@ -270,6 +287,22 @@ fn requests(_ t: Tally) -> Tally {
         t2.check("file found", false)
     }
     t2.check("no file for a field", upload.file("title") == nil)
+    var odd = Data(text: "--b\r\nContent-Disposition: form-data; name=\"a;b\"; filename=\"x;y \\\"q\\\".txt\"\r\n\r\n1\r\n")
+    odd += Data(text: "--b\r\nContent-Disposition: form-data; name=\"c\"; filename*=UTF-8''na%C3%AFve.txt\r\n\r\n2\r\n--b--")
+    let oddUpload = web.Request(method: "POST", headers: ["content-type": "multipart/form-data; boundary=b"], body: odd)
+    t2.same("quoted semicolon", oddUpload.file("a;b")?.fileName ?? "", "x;y \"q\".txt")
+    t2.same("utf-8 file name", oddUpload.file("c")?.fileName ?? "", "naïve.txt")
+    t2.check("file not a field", oddUpload.form()["c"] == nil)
+    let longBoundary = "-".repeated(71)
+    let refused = web.Request(method: "POST", headers: ["content-type": "multipart/form-data; boundary={longBoundary}"],
+                              body: Data(text: "--{longBoundary}\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\n1\r\n--{longBoundary}--"))
+    t2.number("boundary too long", refused.parts().count, 0)
+    // A body made to be slow to search takes time in proportion to its size.
+    let started = now()
+    let slow = web.Request(method: "POST", headers: ["content-type": "multipart/form-data; boundary={"-".repeated(69)}x"],
+                           body: Data(text: "-".repeated(400000)))
+    t2.number("slow body", slow.parts().count, 0)
+    t2.check("slow body is quick", now() - started < 1.0)
 
     let jar = web.Request(headers: ["cookie": "a=1; b=\"quoted\"; c=two%20words; a=2;broken; d=; e=ab+c/d=="])
     t2.same("cookie", jar.cookie("a") ?? "", "1")
@@ -378,6 +411,8 @@ fn sessions(_ t: Tally) -> Tally {
     t2.check("value kept dot", dot > 1)
     t2.same("session changed", ask(router, "GET", "/", headers: ["Cookie": "session={changed}"]).text(), "user=none")
     t2.same("session junk", ask(router, "GET", "/", headers: ["Cookie": "session=junk"]).text(), "user=none")
+    let forged = web.sign(value.substring(from: 0, to: dot), secret: "a secret of at least sixteen characters")
+    t2.same("web.sign isn't a session", ask(router, "GET", "/", headers: ["Cookie": "session={forged}"]).text(), "user=none")
     let logout = ask(router, "POST", "/logout", headers: ["Cookie": "session={value}"])
     t2.check("logout clears", logout.cookies.count == 1 && logout.cookies[0].hasPrefix("session=; Max-Age=0"))
     t2.number("untouched session sends no cookie", ask(router, "GET", "/", headers: ["Cookie": "session={value}"]).cookies.count, 0)
@@ -451,7 +486,8 @@ fn files(_ t: Tally) -> Tally {
     t2.number("encoded slash", ask(router, "GET", "/static/css%2Fsite.css").status, 404)
     t2.number("backslash", ask(router, "GET", "/static/css%5Csite.css").status, 404)
     t2.number("missing file", ask(router, "GET", "/static/nope.txt").status, 404)
-    t2.number("POST to files", ask(router, "POST", "/static/index.html").status, 405)
+    t2.number("POST to files", ask(router, "POST", "/static/index.html").status, 404)
+    t2.same("double slash redirect", ask(router, "GET", "//static//docs").header("location") ?? "", "/static/docs/")
     t2.number("no index option", ask(router, "GET", "/cached/").status, 404)
     t2.same("max age", ask(router, "GET", "/cached/index.html").header("cache-control") ?? "", "public, max-age=3600")
     let download = ask(router, "GET", "/download")
@@ -520,7 +556,7 @@ fn templates(_ t: Tally) -> Tally {
         .failure(e) -> t2.check(e.message, false)
     }
     match web.parseTemplates(["main": "\{\{price}} \{\{whole}} \{\{list}}"]) {
-        .ok(set) -> t2.same("numbers as Tessel writes them", web.render(set, "main", Numbers(price: 2.0, whole: 7, list: [1, 2])), "2.0 7 [1,2]")
+        .ok(set) -> t2.same("numbers as Tessel writes them", web.render(set, "main", Numbers(price: 2.0, whole: 7, list: [1, 2])), "2.0 7 1,2")
         .failure(e) -> t2.check(e.message, false)
     }
 
@@ -539,6 +575,8 @@ fn templates(_ t: Tally) -> Tally {
         ("\{\{#each a}}\{\{else if b}}\{\{/each}}", "t line 1: can't read \{\{else if b}}"),
         ("\{\{}}", "t line 1: an empty tag"),
         ("\{\{> }}", "t line 1: \{\{>}} needs a template's name"),
+        ("\{\{eq a b}}", "t line 1: \{\{eq a b}} calls a helper, and templates have none: work the value out in Tessel and pass it in"),
+        ("\{\{^items}}x\{\{/items}}", "t line 1: \{\{^items}} isn't supported: write \{\{#unless items}}"),
     ]
     for (text, message) in bad {
         match web.parseTemplates(["t": text]) {

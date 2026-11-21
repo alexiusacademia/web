@@ -9,6 +9,10 @@
 //   {{#with user}} {{name}} {{/with}}
 //   {{> header}}, {{> row item}}   another template, with this or `item`
 //   {{! a comment }}, {{!-- a comment with }} in it --}}
+//   {{~name~}}             `~` takes the spaces beside the tag away
+//   {{^}}                  the same as {{else}}
+//   {{@root.title}}        a name in the template's data, from anywhere
+//   \{{name}}              the text {{name}}
 //
 // A name is looked up in the innermost value first, then outwards, so a
 // page's fields can be used inside `each`. `../name` starts one level
@@ -37,6 +41,9 @@ struct Token {
     line: Int
     // For a partial alone on its line: the spaces before it.
     indent: String = ""
+    // `{{~`: take away the spaces before; `~}}`: after.
+    trimBefore: Bool = false
+    trimAfter: Bool = false
 }
 
 // A set of templates by name: "page", "users/show".
@@ -162,6 +169,7 @@ fn parseTemplate(_ text: String, _ name: String) -> Result<[Node]> {
         return Result.failure(error: e)
     }
     removeStandalone(tokens)
+    applyTildes(tokens)
     var at = 0
     var nodes: [Node] = []
     var ending = ""
@@ -174,18 +182,35 @@ fn parseTemplate(_ text: String, _ name: String) -> Result<[Node]> {
 // Cuts a template into text and tags.
 fn tokenize(_ text: String, _ name: String, _ tokens: bind [Token]) -> Error? {
     let chars = text.characters
+    let n = chars.count
     var i = 0
     var line = 1
     var textStart = 0
     var textLine = 1
-    while i < chars.count {
+    while i < n {
         if chars[i] == "\n" {
             line += 1
             i += 1
             continue
         }
-        if chars[i] != "\{" || i + 1 >= chars.count || chars[i + 1] != "\{" {
+        if chars[i] != "\{" || i + 1 >= n || chars[i + 1] != "\{" {
             i += 1
+            continue
+        }
+        // `\{{` is the text `{{`, up to its `}}`.
+        if i > 0 && chars[i - 1] == "\\" {
+            if i - 1 > textStart {
+                tokens.append(Token(kind: "text", text: slice(chars, textStart, i - 1), line: textLine))
+            }
+            textStart = i
+            textLine = line
+            let end = findText(chars, "}}", i + 2)
+            i = if end < 0 { n } else { end + 2 }
+            for c in slice(chars, textStart, i).characters {
+                if c == "\n" {
+                    line += 1
+                }
+            }
             continue
         }
         // A tag starts at i.
@@ -193,49 +218,96 @@ fn tokenize(_ text: String, _ name: String, _ tokens: bind [Token]) -> Error? {
             tokens.append(Token(kind: "text", text: slice(chars, textStart, i), line: textLine))
         }
         let tagLine = line
-        let triple = i + 2 < chars.count && chars[i + 2] == "\{"
-        let open = if triple { 3 } else { 2 }
-        var close = if triple { "}}}" } else { "}}" }
-        let longComment = !triple && slice(chars, i + 2, i + 5) == "!--"
-        if longComment {
-            close = "--}}"
+        var pos = i + 2
+        let trimBefore = pos < n && chars[pos] == "~"
+        if trimBefore {
+            pos += 1
         }
-        let end = findText(chars, close, i + open)
-        if end < 0 {
+        let triple = pos < n && chars[pos] == "\{"
+        if triple {
+            pos += 1
+        }
+        let longComment = !triple && slice(chars, pos, pos + 3) == "!--"
+        var trimAfter = false
+        var innerEnd = -1
+        var next = -1
+        if longComment {
+            let end = findText(chars, "--}}", pos)
+            if end >= 0 {
+                innerEnd = end
+                next = end + 4
+            }
+        } else {
+            let end = findText(chars, "}}", pos)
+            if end >= 0 {
+                if triple {
+                    if end + 2 < n && chars[end + 2] == "}" {
+                        innerEnd = end
+                        next = end + 3
+                    } else if end >= 2 && chars[end - 1] == "~" && chars[end - 2] == "}" {
+                        innerEnd = end - 2
+                        next = end + 2
+                        trimAfter = true
+                    }
+                } else {
+                    innerEnd = end
+                    next = end + 2
+                    if end > pos && chars[end - 1] == "~" {
+                        innerEnd = end - 1
+                        trimAfter = true
+                    }
+                }
+            }
+        }
+        if innerEnd < 0 {
+            let close = if triple { "}}}" } else if longComment { "--}}" } else { "}}" }
             return Error("{name} line {tagLine}: this tag isn't closed with {close}")
         }
-        let inner = slice(chars, i + open, end).trim()
-        for c in slice(chars, i, end).characters {
+        let inner = slice(chars, pos, innerEnd).trim()
+        for c in slice(chars, i, next).characters {
             if c == "\n" {
                 line += 1
             }
         }
-        i = end + close.count
+        i = next
         textStart = i
         textLine = line
+        var token = Token(kind: "show", text: inner, line: tagLine, trimBefore: trimBefore, trimAfter: trimAfter)
         if triple {
-            tokens.append(Token(kind: "raw", text: inner, line: tagLine))
+            token.kind = "raw"
         } else if inner.hasPrefix("!") {
-            tokens.append(Token(kind: "comment", text: "", line: tagLine))
+            token.kind = "comment"
+            token.text = ""
         } else if inner.hasPrefix("#") {
-            tokens.append(Token(kind: "open", text: inner.substring(from: 1, to: inner.count).trim(), line: tagLine))
+            token.kind = "open"
+            token.text = inner.substring(from: 1, to: inner.count).trim()
         } else if inner.hasPrefix("/") {
-            tokens.append(Token(kind: "close", text: inner.substring(from: 1, to: inner.count).trim(), line: tagLine))
+            token.kind = "close"
+            token.text = inner.substring(from: 1, to: inner.count).trim()
         } else if inner.hasPrefix(">") {
-            tokens.append(Token(kind: "partial", text: inner.substring(from: 1, to: inner.count).trim(), line: tagLine))
+            token.kind = "partial"
+            token.text = inner.substring(from: 1, to: inner.count).trim()
         } else if inner.hasPrefix("&") {
-            tokens.append(Token(kind: "raw", text: inner.substring(from: 1, to: inner.count).trim(), line: tagLine))
+            token.kind = "raw"
+            token.text = inner.substring(from: 1, to: inner.count).trim()
         } else if inner == "else" || inner.hasPrefix("else ") {
-            tokens.append(Token(kind: "else", text: inner.substring(from: 4, to: inner.count).trim(), line: tagLine))
-        } else {
-            if inner.isEmpty {
-                return Error("{name} line {tagLine}: an empty tag")
-            }
-            tokens.append(Token(kind: "show", text: inner, line: tagLine))
+            token.kind = "else"
+            token.text = inner.substring(from: 4, to: inner.count).trim()
+        } else if inner == "^" {
+            token.kind = "else"
+            token.text = ""
+        } else if inner.hasPrefix("^") {
+            return Error("{name} line {tagLine}: \{\{{inner}}} isn't supported: write \{\{#unless {inner.substring(from: 1, to: inner.count).trim()}}}")
+        } else if inner.isEmpty {
+            return Error("{name} line {tagLine}: an empty tag")
         }
+        if (token.kind == "show" || token.kind == "raw") && token.text.words().count > 1 {
+            return Error("{name} line {tagLine}: \{\{{inner}}} calls a helper, and templates have none: work the value out in Tessel and pass it in")
+        }
+        tokens.append(token)
     }
-    if chars.count > textStart {
-        tokens.append(Token(kind: "text", text: slice(chars, textStart, chars.count), line: textLine))
+    if n > textStart {
+        tokens.append(Token(kind: "text", text: slice(chars, textStart, n), line: textLine))
     }
     nil
 }
@@ -266,6 +338,19 @@ fn findText(_ chars: [String], _ word: String, _ from: Int) -> Int {
         i += 1
     }
     -1
+}
+
+// `~` takes the spaces and line breaks beside a tag away (after the lines
+// of lone tags are taken away, as Handlebars does).
+fn applyTildes(_ tokens: bind [Token]) {
+    for k in 0..tokens.count {
+        if tokens[k].trimBefore && k > 0 && tokens[k - 1].kind == "text" {
+            tokens[k - 1].text = tokens[k - 1].text.trimEnd()
+        }
+        if tokens[k].trimAfter && k + 1 < tokens.count && tokens[k + 1].kind == "text" {
+            tokens[k + 1].text = tokens[k + 1].text.trimStart()
+        }
+    }
 }
 
 // Takes away the line around a block, else, comment or partial tag that's
@@ -608,6 +693,12 @@ fn lookup(_ scopes: [Scope], _ path: String) -> Value {
     if top < 0 {
         return Value.null
     }
+    if p == "@root" {
+        return scopes[0].value
+    }
+    if p.hasPrefix("@root.") {
+        return follow(scopes[0].value, p.substring(from: 6, to: p.count).split("."))
+    }
     if p == "this" || p == "." {
         return scopes[top].value
     }
@@ -695,6 +786,8 @@ fn display(_ value: Value) -> String {
         .bool(b) -> if b { "true" } else { "false" }
         .number(t) -> t
         .string(s) -> s
+        // As Handlebars shows a list: its items with commas.
+        .list(items) -> items.map({ v in display(v) }).joined(separator: ",")
         _ -> jsonText(value)
     }
 }

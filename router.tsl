@@ -70,6 +70,8 @@ struct Route {
     later: fn(Request, fn(Response))? = nil
     // The middleware of the routers it was mounted from, outermost first.
     middleware: [Middleware] = []
+    // A folder of files: other methods get a 404, not a 405.
+    files: Bool = false
 }
 
 // Routes and middleware: what a server does with each request.
@@ -124,7 +126,7 @@ public struct Router {
         let base = trimSlashes(prefix)
         let pattern = if base.isEmpty { "/*file" } else { "/" + base + "/*file" }
         routes.append(Route(method: "GET", pattern: pattern, segments: parsePattern(pattern),
-                            answer: { r in folderFile(folder, r, restOf(r), options) }))
+                            answer: { r in folderFile(folder, r, restOf(r), options) }, files: true))
     }
 
     // Adds middleware for every request, routes or not, in the order added.
@@ -157,6 +159,7 @@ public struct Router {
     fn handle(_ request: Request, _ reply: fn(Response)) {
         var req = request
         req.method = req.method.uppercase()
+        req.path = normalizedPath(req.path)
         if req.received == 0 {
             req.received = now()
         }
@@ -179,7 +182,7 @@ fn dispatch(_ router: Router, _ request: Request, _ reply: fn(Response)) {
             let fits = route.method == "*" || route.method == request.method ||
                 (request.method == "HEAD" && route.method == "GET")
             if !fits {
-                if !allowed.contains(route.method) {
+                if !route.files && !allowed.contains(route.method) {
                     allowed.append(route.method)
                 }
             } else {
@@ -241,8 +244,9 @@ match m.before(request) {
 }
 
 // Whether a route with these segment kinds beats one with `other`: the
-// first difference decides, fixed text before `:name` before `*name`;
-// then the longer pattern.
+// first difference decides, fixed text before `:name` before `*name`.
+// When one is the other plus a `*name` (`/docs` and `/docs/*rest`), the
+// one without it wins.
 fn better(_ score: [Int], _ other: [Int]) -> Bool {
     var i = 0
     while i < score.count && i < other.count {
@@ -251,7 +255,7 @@ fn better(_ score: [Int], _ other: [Int]) -> Bool {
         }
         i += 1
     }
-    score.count > other.count
+    score.count < other.count
 }
 
 // A pattern's parts.
@@ -367,6 +371,46 @@ public fn call(_ router: Router, _ method: String, _ path: String, body: String 
         answer = response
     }
     answer
+}
+
+// A path as routes and middleware see it: without empty parts ("//a" is
+// "/a"), and with percent codes of letters, digits and `-._~` decoded
+// ("/%61dmin" is "/admin"), so a check like `r.path.hasPrefix("/admin")`
+// sees what the router sees. A trailing slash is kept.
+fn normalizedPath(_ path: String) -> String {
+    let parts = splitPath(path).map { p in decodeUnreserved(p) }
+    let trailing = path.hasSuffix("/") && !parts.isEmpty
+    "/" + parts.joined(separator: "/") + (if trailing { "/" } else { "" })
+}
+
+// Percent codes of characters that never need one, decoded.
+fn decodeUnreserved(_ part: String) -> String {
+    if !part.contains("%") {
+        return part
+    }
+    let chars = part.characters
+    var out: [String] = []
+    var i = 0
+    while i < chars.count {
+        if chars[i] == "%" && i + 2 < chars.count {
+            let hi = hexDigit(chars[i + 1])
+            let lo = hexDigit(chars[i + 2])
+            if hi >= 0 && lo >= 0 {
+                let code = hi * 16 + lo
+                let c = codePointText(code)
+                let unreserved = (code >= 48 && code <= 57) || (code >= 65 && code <= 90) ||
+                    (code >= 97 && code <= 122) || code == 45 || code == 46 || code == 95 || code == 126
+                if unreserved {
+                    out.append(c)
+                    i += 3
+                    continue
+                }
+            }
+        }
+        out.append(chars[i])
+        i += 1
+    }
+    out.joined(separator: "")
 }
 
 // A percent-encoded part of a path, decoded. Unlike a query, a `+` in a

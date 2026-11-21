@@ -41,14 +41,18 @@ public fn cors(origins: [String] = ["*"], methods: [String] = ["GET", "HEAD", "P
         }
         Step.next(request: request)
     }, after: { request, response in
+        // Unless every site gets the same answer, it depends on Origin,
+        // and caches must know.
+        let varies = !origins.contains("*") || credentials
+        let r = if varies { addVary(response, "Origin") } else { response }
         let origin = request.header("origin") ?? ""
         if origin.isEmpty {
-            return response
+            return r
         }
         if let allowed = allowedOrigin(origin, origins, credentials) {
-            return corsHeaders(response, allowed, credentials)
+            return corsHeaders(r, allowed, credentials)
         }
-        response
+        r
     })
 }
 
@@ -67,7 +71,7 @@ fn allowedOrigin(_ origin: String, _ origins: [String], _ credentials: Bool) -> 
 fn corsHeaders(_ response: Response, _ allowed: String, _ credentials: Bool) -> Response {
     var r = response.withHeader("Access-Control-Allow-Origin", allowed)
     if allowed != "*" {
-        r = r.withHeader("Vary", "Origin")
+        r = addVary(r, "Origin")
     }
     if credentials {
         r = r.withHeader("Access-Control-Allow-Credentials", "true")
@@ -98,6 +102,17 @@ public fn basicAuth(realm: String = "Restricted", check: fn(String, String) -> B
     }
 }
 
+// The answer with `name` in its Vary header (once).
+fn addVary(_ response: Response, _ name: String) -> Response {
+    let vary = response.header("vary") ?? ""
+    for v in vary.split(",") {
+        if v.trim().lowercase() == name.lowercase() || v.trim() == "*" {
+            return response
+        }
+    }
+    response.withHeader("Vary", if vary.trim().isEmpty { name } else { vary + ", " + name })
+}
+
 // Compresses answers with gzip for clients that take it: text, HTML, CSS,
 // JavaScript, JSON, XML and SVG of at least `minimum` bytes.
 public fn compress(minimum: Int = 1024) -> Middleware {
@@ -118,8 +133,7 @@ public fn compress(minimum: Int = 1024) -> Middleware {
         r = r.withHeader("Content-Encoding", "gzip")
         // Ranges count the bytes as they were.
         r.headers = withoutHeader(r.headers, "accept-ranges")
-        let vary = response.header("vary") ?? ""
-        r = r.withHeader("Vary", if vary.isEmpty { "Accept-Encoding" } else { vary + ", Accept-Encoding" })
+        r = addVary(r, "Accept-Encoding")
         if let tag = response.header("etag") {
             // The compressed bytes are different bytes.
             if !tag.hasPrefix("W/") {
@@ -198,10 +212,13 @@ public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 120
         print("web: a session secret must be at least 16 characters")
         exit(1)
     }
+    // A key of its own, so a value signed with `web.sign` and the same
+    // secret is never a session.
+    let key = hmac(key: Data(text: secret), message: Data(text: "web sessions")).hex
     Middleware(before: { request in
         var passed = request
         if let raw = request.cookie(cookie) {
-            if let payload = unsign(raw, secret: secret) {
+            if let payload = unsign(raw, secret: key) {
                 if let bytes = decodeBase64(fromBase64Url(payload)) {
                     let saved: SavedSession? = fromJson(bytes.text ?? "")
                     if let s = saved {
@@ -225,7 +242,7 @@ public fn sessions(secret: String, cookie: String = "session", maxAge: Int = 120
             }
             let saved = SavedSession(values: values, expires: now() + Float(maxAge))
             let payload = toBase64Url(Data(text: toJson(saved)).base64)
-            return r.withCookie(cookie, sign(payload, secret: secret), maxAge: maxAge, secure: secure, sameSite: sameSite)
+            return r.withCookie(cookie, sign(payload, secret: key), maxAge: maxAge, secure: secure, sameSite: sameSite)
         }
         response
     })

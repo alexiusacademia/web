@@ -102,6 +102,14 @@ const handwritten = [
   ["standalone partial", "start\n  {{> p2}}\nend\n"],
   ["standalone partial top", "{{> p2}}\nend\n"],
   ["value line", "a\n  {{name}}\nb\n"],
+  ["tilde both", "a  {{~name~}}  b"],
+  ["tilde block", "<p>\n  {{~#if nope~}}\n  yes\n  {{~else~}}\n  no\n  {{~/if~}}\n</p>"],
+  ["tilde raw", "[ {{~{html}~}} ]"],
+  ["tilde each", "<ul>\n  {{#each items~}}\n  <li>{{this}}</li>\n  {{~/each}}\n</ul>"],
+  ["caret else", "{{#if nope}}yes{{^}}no{{/if}}"],
+  ["root", "{{#each people}}{{name}}/{{@root.title}}/{{@root.user.name}} {{/each}}"],
+  ["escaped mustache", "a \\{{name}} b {{name}}"],
+  ["list shown", "{{items}} [{{empty}}] {{people.0.tags}}"],
   ["html page", "<!doctype html>\n<title>{{title}}</title>\n<h1>{{user.name}}</h1>\n{{#if people}}\n<ul>\n  {{#each people}}\n  <li class=\"{{#if @first}}first{{/if}}\">{{name}}</li>\n  {{/each}}\n</ul>\n{{/if}}\n"],
 ];
 
@@ -127,15 +135,24 @@ const showPaths = ["name", "title", "count", "zero", "flag", "nope", "user.name"
 const condPaths = ["flag", "nope", "zero", "count", "items", "empty", "user", "name", "nothing", "missing"];
 const eachPaths = ["items", "people", "empty", "map", "user.name.x"];
 
+// Sometimes adds `~` to a tag's ends.
+function tilde(tag) {
+  const r = rand(6);
+  if (r === 0) return tag.replace(/^\{\{/, "{{~");
+  if (r === 1) return tag.replace(/\}\}$/, "~}}");
+  if (r === 2) return tag.replace(/^\{\{/, "{{~").replace(/\}\}$/, "~}}");
+  return tag;
+}
+
 function piece(depth) {
   const r = rand(depth > 2 ? 4 : 9);
   if (r === 0) return pick(texts);
-  if (r === 1) return `{{${pick(showPaths)}}}`;
+  if (r === 1) return tilde(`{{${pick(showPaths)}}}`);
   if (r === 2) return pick(["{{{html}}}", "{{& title}}", "{{! c }}", "{{> p1}}"]);
   if (r === 3) return pick(texts) + `{{${pick(showPaths)}}}`;
   const nl = rand(2) === 0;
   const pad = pick(["", "", "  "]);
-  const open = (tag) => (nl ? `\n${pad}{{${tag}}}\n` : `{{${tag}}}`);
+  const open = (tag) => (nl ? `\n${pad}${tilde(`{{${tag}}}`)}\n` : tilde(`{{${tag}}}`));
   const body = () => seq(depth + 1);
   if (r === 4 || r === 5) {
     const kind = pick(["if", "unless"]);

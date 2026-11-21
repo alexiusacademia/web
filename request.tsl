@@ -12,7 +12,9 @@ public struct Request {
     id: Int = 0
     // "GET", "POST", …, in capitals.
     method: String = "GET"
-    // The path as sent, without the query: "/users/ann%20lee".
+    // The path without the query, still encoded ("/users/ann%20lee"),
+    // tidied as routes see it: no empty parts, and letters and digits
+    // decoded ("//%61dmin" is "/admin").
     path: String = "/"
     // What followed `?`, as sent: "page=2&sort=name".
     query: String = ""
@@ -108,7 +110,8 @@ public struct Request {
             return []
         }
         let boundary = headerParameter(header("content-type") ?? "", "boundary")
-        if boundary.isEmpty {
+        // RFC 2046: 1 to 70 characters.
+        if boundary.isEmpty || boundary.count > 70 {
             return []
         }
         multipartParts(body, boundary)
@@ -228,43 +231,115 @@ fn formPairs(_ text: String) -> [(String, String)] {
 
 // A parameter of a header value: `boundary` of
 // `multipart/form-data; boundary=xyz`, without quotes. "" if missing.
+// Quoted values can hold `;` and escaped quotes.
 fn headerParameter(_ value: String, _ name: String) -> String {
-    let parts = value.split(";")
-    var i = 1
-    while i < parts.count {
-        let p = parts[i].trim()
-        if let eq = p.find("=") {
-            if p.substring(from: 0, to: eq).trim().lowercase() == name {
-                var v = p.substring(from: eq + 1, to: p.count).trim()
-                if v.count >= 2 && v.hasPrefix("\"") && v.hasSuffix("\"") {
-                    v = v.substring(from: 1, to: v.count - 1).replace("\\\"", with: "\"")
-                }
-                return v
-            }
+    for (key, v) in headerParameters(value) {
+        if key == name {
+            return v
         }
-        i += 1
     }
     ""
 }
 
-// Where `needle` first appears in `data` at or after `from`, or -1.
+// The `name=value` parameters after the first `;` of a header value, names
+// in lowercase.
+fn headerParameters(_ value: String) -> [(String, String)] {
+    var out: [(String, String)] = []
+    let chars = value.characters
+    var i = 0
+    // Skip the value before the first `;`.
+    var quoted = false
+    while i < chars.count && (quoted || chars[i] != ";") {
+        if chars[i] == "\"" {
+            quoted = !quoted
+        }
+        i += 1
+    }
+    while i < chars.count {
+        i += 1
+        var key: [String] = []
+        while i < chars.count && chars[i] != "=" && chars[i] != ";" {
+            key.append(chars[i])
+            i += 1
+        }
+        var v: [String] = []
+        if i < chars.count && chars[i] == "=" {
+            i += 1
+            while i < chars.count && chars[i] == " " {
+                i += 1
+            }
+            if i < chars.count && chars[i] == "\"" {
+                i += 1
+                while i < chars.count && chars[i] != "\"" {
+                    if chars[i] == "\\" && i + 1 < chars.count {
+                        i += 1
+                    }
+                    v.append(chars[i])
+                    i += 1
+                }
+                i += 1
+                while i < chars.count && chars[i] != ";" {
+                    i += 1
+                }
+            } else {
+                while i < chars.count && chars[i] != ";" {
+                    v.append(chars[i])
+                    i += 1
+                }
+            }
+        }
+        let k = key.joined(separator: "").trim().lowercase()
+        if !k.isEmpty {
+            out.append((k, v.joined(separator: "").trim()))
+        }
+    }
+    out
+}
+
+// An RFC 5987 value (`UTF-8''na%C3%AFve.txt`) decoded, or nil.
+fn extendedValue(_ value: String) -> String? {
+    if let q = value.find("''") {
+        let encoded = value.substring(from: q + 2, to: value.count)
+        return pathDecoded(encoded)
+    }
+    nil
+}
+
+// Where `needle` first appears in `data` at or after `from`, or -1. It
+// takes time in proportion to the bytes searched, whatever they are
+// (Knuth-Morris-Pratt).
 fn findBytes(_ data: Data, _ needle: Data, from: Int) -> Int {
     let n = needle.count
     if n == 0 {
         return from
     }
-    let first = needle[0]
+    // fail[k]: the length of the longest proper prefix of needle[0...k]
+    // that's also a suffix of it.
+    var fail: [Int] = [0]
+    var k = 0
+    var q = 1
+    while q < n {
+        while k > 0 && needle[q] != needle[k] {
+            k = fail[k - 1]
+        }
+        if needle[q] == needle[k] {
+            k += 1
+        }
+        fail.append(k)
+        q += 1
+    }
+    var matched = 0
     var i = max(from, 0)
-    let last = data.count - n
-    while i <= last {
-        if data[i] == first {
-            var k = 1
-            while k < n && data[i + k] == needle[k] {
-                k += 1
-            }
-            if k == n {
-                return i
-            }
+    while i < data.count {
+        let b = data[i]
+        while matched > 0 && b != needle[matched] {
+            matched = fail[matched - 1]
+        }
+        if b == needle[matched] {
+            matched += 1
+        }
+        if matched == n {
+            return i - n + 1
         }
         i += 1
     }
@@ -310,9 +385,15 @@ fn multipartParts(_ body: Data, _ boundary: String) -> [Part] {
                 let name = line.substring(from: 0, to: colon).trim().lowercase()
                 let value = line.substring(from: colon + 1, to: line.count).trim()
                 if name == "content-disposition" {
-                    part.name = headerParameter(value, "name")
-                    if value.lowercase().contains("filename=") {
-                        part.fileName = headerParameter(value, "filename")
+                    for (key, v) in headerParameters(value) {
+                        if key == "name" {
+                            part.name = v
+                        } else if key == "filename" && part.fileName == nil {
+                            part.fileName = v
+                        } else if key == "filename*" {
+                            // The UTF-8 name wins over the plain one.
+                            part.fileName = extendedValue(v) ?? v
+                        }
                     }
                 } else if name == "content-type" {
                     part.contentType = value

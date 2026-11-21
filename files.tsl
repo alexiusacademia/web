@@ -29,6 +29,9 @@ fn folderFile(_ folder: String, _ request: Request, _ rest: [String], _ options:
         if name.hasPrefix(".") && !options.dotFiles {
             return status(404)
         }
+        if platform() == "windows" && !windowsSafe(name) {
+            return status(404)
+        }
         names.append(name)
     }
     var path = folder
@@ -40,7 +43,10 @@ fn folderFile(_ folder: String, _ request: Request, _ rest: [String], _ options:
             return status(404)
         }
         if !request.path.hasSuffix("/") {
-            let target = if request.query.isEmpty { request.path + "/" } else { request.path + "/?" + request.query }
+            // From the path's parts, so it never starts with "//" (which
+            // a browser would read as another site).
+            let clean = "/" + splitPath(request.path).joined(separator: "/") + "/"
+            let target = if request.query.isEmpty { clean } else { clean + "?" + request.query }
             return redirect(target, status: 301)
         }
         path = joinPath(path, options.index)
@@ -137,9 +143,27 @@ fn rangeApplies(_ request: Request, _ tag: String, _ modified: Float) -> Bool {
             return given == tag
         }
         if let t = parseHttpDate(given) {
-            return modified <= t
+            return modified == t
         }
         return false
+    }
+    true
+}
+
+// Whether Windows reads a name as the file it says: not a device (CON,
+// NUL, COM1…), not a short 8.3 name (GITIGN~1), and not ending in a dot
+// or a space (which Windows drops).
+fn windowsSafe(_ name: String) -> Bool {
+    if name.hasSuffix(".") || name.hasSuffix(" ") || name.contains("~") {
+        return false
+    }
+    let base = name.substring(from: 0, to: name.find(".") ?? name.count).trim().uppercase()
+    let devices = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    if devices.contains(base) {
+        return false
+    }
+    if base.count == 4 && (base.hasPrefix("COM") || base.hasPrefix("LPT")) {
+        return !"0123456789¹²³".contains(base.substring(from: 3, to: 4))
     }
     true
 }
